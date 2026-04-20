@@ -22,6 +22,7 @@ The project is actively evolving. Core workflows are already usable:
 
 - `init`, `add`, `remove`, `ls`
 - `search` (interactive/non-interactive, install from results)
+- `group`, `tree`, `why`
 - `lock`, `sync`, `cache`, `doctor`
 - `env`, `run`, `import`, `export`
 
@@ -74,10 +75,81 @@ mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 Main commands:
 
 - `init` / `add` / `remove` / `ls`
+- `group` / `tree` / `why`
 - `search` / `update` / `pin` / `lock`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
 - `import` / `export`
+
+## Dependency Groups
+
+`mineconda` supports named dependency groups for splitting one project into multiple install
+surfaces, similar to optional dependency groups in `uv`.
+
+Model:
+
+- top-level `mods = [...]` is the default group: `default`
+- optional groups live under `[groups.<name>]`
+- group names must be lowercase kebab-case
+- commands activate only `default` unless you pass `--group <name>` or `--all-groups`
+
+Example:
+
+```toml
+[project]
+name = "mypack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "21.1.227"
+
+mods = [
+  { id = "jei", source = "modrinth", version = "latest", side = "both" }
+]
+
+[groups.client]
+mods = [
+  { id = "iris", source = "modrinth", version = "latest", side = "client" }
+]
+
+[groups.dev]
+mods = [
+  { id = "spark", source = "modrinth", version = "latest", side = "both" }
+]
+```
+
+Typical workflow:
+
+```bash
+# add to the default group
+mineconda add jei
+
+# create and populate an extra group
+mineconda group add client
+mineconda add iris --group client
+
+# inspect one group
+mineconda ls --group client
+mineconda tree --group client
+mineconda why iris --group client
+
+# resolve all groups together
+mineconda lock --all-groups
+
+# sync default + client for a local dev instance
+mineconda sync --group client
+mineconda run --mode client --group client
+```
+
+Notes:
+
+- selecting any extra group always includes `default`
+- `lock`, `sync`, `tree`, `why`, `run`, and `export` support `--group` / `--all-groups`
+- old lockfiles may not contain group metadata; rerun `mineconda lock` if a group-aware
+  command asks for it
+- `run --mode client|server|both` does not auto-select groups; group activation is always
+  explicit
 
 ## Search UX
 

@@ -22,6 +22,7 @@
 
 - `init`、`add`、`remove`、`ls`
 - `search`（交互式 / 非交互式，支持从结果直接安装）
+- `group`、`tree`、`why`
 - `lock`、`sync`、`cache`、`doctor`
 - `env`、`run`、`import`、`export`
 
@@ -74,10 +75,79 @@ mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 主要命令：
 
 - `init` / `add` / `remove` / `ls`
+- `group` / `tree` / `why`
 - `search` / `update` / `pin` / `lock`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
 - `import` / `export`
+
+## Dependency Groups
+
+`mineconda` 支持命名依赖组，用来把一个项目拆成多个可选安装面，语义上接近 `uv`
+里的 optional dependency groups。
+
+模型：
+
+- 顶层 `mods = [...]` 就是默认组 `default`
+- 可选组写在 `[groups.<name>]` 下
+- 组名必须是小写 kebab-case
+- 命令默认只激活 `default`，需要显式传 `--group <name>` 或 `--all-groups` 才会启用额外组
+
+示例：
+
+```toml
+[project]
+name = "mypack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "21.1.227"
+
+mods = [
+  { id = "jei", source = "modrinth", version = "latest", side = "both" }
+]
+
+[groups.client]
+mods = [
+  { id = "iris", source = "modrinth", version = "latest", side = "client" }
+]
+
+[groups.dev]
+mods = [
+  { id = "spark", source = "modrinth", version = "latest", side = "both" }
+]
+```
+
+常见工作流：
+
+```bash
+# 添加到默认组
+mineconda add jei
+
+# 创建并写入额外组
+mineconda group add client
+mineconda add iris --group client
+
+# 只查看某个组
+mineconda ls --group client
+mineconda tree --group client
+mineconda why iris --group client
+
+# 一次解析所有组
+mineconda lock --all-groups
+
+# 为本地开发实例同步 default + client
+mineconda sync --group client
+mineconda run --mode client --group client
+```
+
+说明：
+
+- 只要选择了额外组，`default` 总会一并激活
+- `lock`、`sync`、`tree`、`why`、`run`、`export` 都支持 `--group` / `--all-groups`
+- 旧锁文件可能没有 group metadata；如果命令要求，请重新执行一次 `mineconda lock`
+- `run --mode client|server|both` 不会自动选择组，组激活始终是显式行为
 
 ## 搜索交互
 
