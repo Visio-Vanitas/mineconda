@@ -25,3 +25,6 @@ mineconda-resolver = { path = "../mineconda-resolver" }
 mineconda-runner = { path = "../mineconda-runner" }
 mineconda-runtime = { path = "../mineconda-runtime" }
 mineconda-sync = { path = "../mineconda-sync" }
+
+[dev-dependencies]
+toml.workspace = true

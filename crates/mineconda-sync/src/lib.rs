@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use mineconda_core::{
     HashAlgorithm, LockMetadata, LockedPackage, Lockfile, ModSource, S3CacheAuth, S3CacheConfig,
+    http_user_agent,
 };
 use quick_xml::de::from_str as from_xml_str;
 use rayon::ThreadPoolBuilder;
@@ -100,7 +101,7 @@ pub struct RemotePruneReport {
 
 pub fn sync_lockfile(lockfile: &mut Lockfile, request: &SyncRequest) -> Result<SyncReport> {
     let client = Client::builder()
-        .user_agent("mineconda/0.1.0 (+https://github.com/placeholder/mineconda)")
+        .user_agent(http_user_agent())
         .build()
         .context("failed to build HTTP client for sync")?;
 
@@ -301,7 +302,7 @@ pub fn remote_prune_s3_cache(
     request: &RemotePruneRequest,
 ) -> Result<RemotePruneReport> {
     let client = Client::builder()
-        .user_agent("mineconda/0.1.0 (+https://github.com/placeholder/mineconda)")
+        .user_agent(http_user_agent())
         .build()
         .context("failed to build HTTP client for remote prune")?;
     let backend = configure_s3_cache_backend(Some(config))?

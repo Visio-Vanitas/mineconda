@@ -3,15 +3,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::thread::sleep;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use mineconda_core::{
     HashAlgorithm, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, PackageHash,
-    S3SourceConfig,
+    S3SourceConfig, http_user_agent,
 };
-use reqwest::blocking::Client;
+use reqwest::StatusCode;
+use reqwest::blocking::{Client, Response};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +31,7 @@ const FORGE_MAVEN_METADATA_API: &str =
 const MINECRAFT_GAME_ID: usize = 432;
 const SEARCH_CACHE_TTL_SECS: u64 = 30 * 60;
 const SEARCH_CACHE_SCHEMA_VERSION: u32 = 2;
+const HTTP_RETRY_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct ResolveRequest {
@@ -297,14 +300,12 @@ fn resolve_loader_version_from_meta(
     loader_name: &str,
 ) -> Result<String> {
     let url = format!("{api_base}/{minecraft}");
-    let entries = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("failed to query {loader_name} metadata"))?
-        .error_for_status()
-        .with_context(|| format!("{loader_name} metadata request failed"))?
-        .json::<Vec<LoaderMetaEntry>>()
-        .with_context(|| format!("failed to decode {loader_name} metadata"))?;
+    let entries = send_with_retry(
+        || client.get(&url),
+        &format!("failed to query {loader_name} metadata"),
+    )?
+    .json::<Vec<LoaderMetaEntry>>()
+    .with_context(|| format!("failed to decode {loader_name} metadata"))?;
 
     if let Some(stable) = entries.iter().find(|entry| {
         entry.loader.stable.unwrap_or(true) && !entry.loader.version.trim().is_empty()
@@ -377,12 +378,7 @@ fn resolve_latest_forge_loader_version(client: &Client, minecraft: &str) -> Resu
 }
 
 fn fetch_text(client: &Client, url: &str, label: &str) -> Result<String> {
-    client
-        .get(url)
-        .send()
-        .with_context(|| format!("failed to query {label}"))?
-        .error_for_status()
-        .with_context(|| format!("{label} request failed"))?
+    send_with_retry(|| client.get(url), &format!("failed to query {label}"))?
         .text()
         .with_context(|| format!("failed to read {label} body"))
 }
@@ -797,16 +793,15 @@ fn resolve_modrinth_requirement(
     let loaders = format!("[\"{loader}\"]");
     let game_versions = format!("[\"{}\"]", manifest.project.minecraft);
     let endpoint = format!("{MODRINTH_PROJECT_VERSION_API}/{}/version", requirement.id);
-    let response = client
-        .get(endpoint)
-        .query(&[
-            ("loaders", loaders.as_str()),
-            ("game_versions", game_versions.as_str()),
-        ])
-        .send()
-        .with_context(|| format!("failed to query Modrinth project {}", requirement.id))?
-        .error_for_status()
-        .with_context(|| format!("Modrinth API returned error for {}", requirement.id))?;
+    let response = send_with_retry(
+        || {
+            client.get(&endpoint).query(&[
+                ("loaders", loaders.as_str()),
+                ("game_versions", game_versions.as_str()),
+            ])
+        },
+        &format!("failed to query Modrinth project {}", requirement.id),
+    )?;
 
     let versions: Vec<ModrinthVersion> = response
         .json()
@@ -902,17 +897,18 @@ fn resolve_curseforge_requirement(
     let mod_id = resolve_curseforge_mod_id(client, &requirement.id, &api_key)?;
 
     let endpoint = format!("{CURSEFORGE_FILES_API}/{mod_id}/files");
-    let response = client
-        .get(endpoint)
-        .query(&[
-            ("gameVersion", manifest.project.minecraft.as_str()),
-            ("pageSize", "50"),
-        ])
-        .header("x-api-key", &api_key)
-        .send()
-        .with_context(|| format!("failed to query CurseForge files for mod {mod_id}"))?
-        .error_for_status()
-        .with_context(|| format!("CurseForge files API returned error for mod {mod_id}"))?;
+    let response = send_with_retry(
+        || {
+            client
+                .get(&endpoint)
+                .query(&[
+                    ("gameVersion", manifest.project.minecraft.as_str()),
+                    ("pageSize", "50"),
+                ])
+                .header("x-api-key", &api_key)
+        },
+        &format!("failed to query CurseForge files for mod {mod_id}"),
+    )?;
 
     let payload: CurseforgeFilesResponse = response
         .json()
@@ -1049,19 +1045,20 @@ fn resolve_curseforge_mod_id(client: &Client, raw_id: &str, api_key: &str) -> Re
     }
 
     let game_id = MINECRAFT_GAME_ID.to_string();
-    let response = client
-        .get(CURSEFORGE_SEARCH_API)
-        .query(&[
-            ("gameId", game_id.as_str()),
-            ("searchFilter", raw_id),
-            ("classId", "6"),
-            ("pageSize", "10"),
-        ])
-        .header("x-api-key", api_key)
-        .send()
-        .with_context(|| format!("failed to query CurseForge mod {raw_id}"))?
-        .error_for_status()
-        .with_context(|| format!("CurseForge search returned error for {raw_id}"))?;
+    let response = send_with_retry(
+        || {
+            client
+                .get(CURSEFORGE_SEARCH_API)
+                .query(&[
+                    ("gameId", game_id.as_str()),
+                    ("searchFilter", raw_id),
+                    ("classId", "6"),
+                    ("pageSize", "10"),
+                ])
+                .header("x-api-key", api_key)
+        },
+        &format!("failed to query CurseForge mod {raw_id}"),
+    )?;
 
     let payload: CurseforgeModSearchResponse = response
         .json()
@@ -1697,18 +1694,17 @@ fn search_modrinth(request: &SearchRequest) -> Result<Vec<SearchResult>> {
         .saturating_sub(1)
         .saturating_mul(request.limit)
         .to_string();
-    let response = client
-        .get(MODRINTH_SEARCH_API)
-        .query(&[
-            ("query", request.query.as_str()),
-            ("limit", limit.as_str()),
-            ("offset", offset.as_str()),
-            ("facets", facets.as_str()),
-        ])
-        .send()
-        .context("failed to query Modrinth API")?
-        .error_for_status()
-        .context("Modrinth API returned an error status")?;
+    let response = send_with_retry(
+        || {
+            client.get(MODRINTH_SEARCH_API).query(&[
+                ("query", request.query.as_str()),
+                ("limit", limit.as_str()),
+                ("offset", offset.as_str()),
+                ("facets", facets.as_str()),
+            ])
+        },
+        "failed to query Modrinth API",
+    )?;
 
     let payload: ModrinthResponse = response
         .json()
@@ -1781,17 +1777,17 @@ fn list_modrinth_install_versions(
         query_params.push(("game_versions", game_versions));
     }
 
-    let request_builder = client.get(endpoint);
-    let request_builder = if query_params.is_empty() {
-        request_builder
-    } else {
-        request_builder.query(&query_params)
-    };
-    let response = request_builder
-        .send()
-        .with_context(|| format!("failed to query Modrinth project {}", request.id))?
-        .error_for_status()
-        .with_context(|| format!("Modrinth API returned error for {}", request.id))?;
+    let response = send_with_retry(
+        || {
+            let request_builder = client.get(&endpoint);
+            if query_params.is_empty() {
+                request_builder
+            } else {
+                request_builder.query(&query_params)
+            }
+        },
+        &format!("failed to query Modrinth project {}", request.id),
+    )?;
 
     let mut versions: Vec<ModrinthVersion> = response
         .json()
@@ -1836,14 +1832,15 @@ fn list_curseforge_install_versions(
         query_params.push(("gameVersion", minecraft_version.to_string()));
     }
 
-    let response = client
-        .get(endpoint)
-        .query(&query_params)
-        .header("x-api-key", api_key)
-        .send()
-        .with_context(|| format!("failed to query CurseForge files for mod {mod_id}"))?
-        .error_for_status()
-        .with_context(|| format!("CurseForge files API returned error for mod {mod_id}"))?;
+    let response = send_with_retry(
+        || {
+            client
+                .get(&endpoint)
+                .query(&query_params)
+                .header("x-api-key", &api_key)
+        },
+        &format!("failed to query CurseForge files for mod {mod_id}"),
+    )?;
     let payload: CurseforgeFilesResponse = response
         .json()
         .context("failed to decode CurseForge files response")?;
@@ -1971,14 +1968,15 @@ fn search_curseforge(request: &SearchRequest) -> Result<Vec<SearchResult>> {
     {
         query_params.push(("gameVersion", minecraft_version));
     }
-    let response = client
-        .get(CURSEFORGE_SEARCH_API)
-        .query(&query_params)
-        .header("x-api-key", api_key)
-        .send()
-        .context("failed to query CurseForge API")?
-        .error_for_status()
-        .context("CurseForge API returned an error status")?;
+    let response = send_with_retry(
+        || {
+            client
+                .get(CURSEFORGE_SEARCH_API)
+                .query(&query_params)
+                .header("x-api-key", &api_key)
+        },
+        "failed to query CurseForge API",
+    )?;
 
     let payload: CurseforgeResponse = response
         .json()
@@ -2021,25 +2019,26 @@ fn search_curseforge(request: &SearchRequest) -> Result<Vec<SearchResult>> {
 fn search_mcmod(request: &SearchRequest) -> Result<Vec<SearchResult>> {
     let client = build_http_client()?;
     let page = request.page.to_string();
-    let response = client
-        .get(MCMOD_SEARCH_API)
-        .query(&[
-            ("key", request.query.as_str()),
-            ("filter", "1"),
-            ("mold", "1"),
-            ("page", page.as_str()),
-        ])
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-        .send()
-        .context("failed to query mcmod.cn search")?
-        .error_for_status()
-        .context("mcmod.cn search returned an error status")?;
+    let response = send_with_retry(
+        || {
+            client
+                .get(MCMOD_SEARCH_API)
+                .query(&[
+                    ("key", request.query.as_str()),
+                    ("filter", "1"),
+                    ("mold", "1"),
+                    ("page", page.as_str()),
+                ])
+                .header("Accept-Language", "zh-CN,zh;q=0.9")
+        },
+        "failed to query mcmod.cn search",
+    )?;
 
     let payload = response
         .text()
         .context("failed to decode mcmod.cn search response")?;
 
-    if payload.contains("安全验证") {
+    if mcmod_requires_security_verification(&payload) {
         bail!(
             "mcmod.cn requires interactive security verification for this request. retry later or use --source modrinth/curseforge"
         );
@@ -2180,7 +2179,7 @@ fn enrich_mcmod_search_links(results: &mut [SearchResult]) -> Result<()> {
         let Ok(payload) = response.text() else {
             continue;
         };
-        if payload.contains("安全验证") {
+        if mcmod_requires_security_verification(&payload) {
             continue;
         }
 
@@ -2617,9 +2616,75 @@ fn strip_html_tags(input: &str) -> String {
     output
 }
 
+fn mcmod_requires_security_verification(payload: &str) -> bool {
+    payload.contains("安全验证")
+        || payload.contains("访问验证")
+        || payload.contains("人机验证")
+        || payload.contains("验证码")
+}
+
+fn send_with_retry<F>(mut build: F, label: &str) -> Result<Response>
+where
+    F: FnMut() -> reqwest::blocking::RequestBuilder,
+{
+    let mut last_error = None;
+
+    for attempt in 0..HTTP_RETRY_ATTEMPTS {
+        match build().send() {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    if attempt + 1 < HTTP_RETRY_ATTEMPTS
+                        && err.status().is_some_and(should_retry_http_status)
+                    {
+                        last_error = Some(anyhow!("{label}: {err}"));
+                        sleep(http_retry_backoff(attempt));
+                        continue;
+                    }
+                    return Err(err).context(label.to_string());
+                }
+            },
+            Err(err) => {
+                if attempt + 1 < HTTP_RETRY_ATTEMPTS && should_retry_http_error(&err) {
+                    last_error = Some(anyhow!("{label}: {err}"));
+                    sleep(http_retry_backoff(attempt));
+                    continue;
+                }
+                return Err(err).context(label.to_string());
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("{label}: request did not succeed")))
+}
+
+fn should_retry_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::INTERNAL_SERVER_ERROR
+    )
+}
+
+fn should_retry_http_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn http_retry_backoff(attempt: usize) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(250),
+        1 => Duration::from_millis(800),
+        _ => Duration::from_millis(1500),
+    }
+}
+
 fn build_http_client() -> Result<Client> {
     let mut builder = Client::builder()
-        .user_agent("mineconda/0.1.0 (+https://github.com/placeholder/mineconda)")
+        .user_agent(http_user_agent())
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(35));
 
@@ -2887,6 +2952,23 @@ mod tests {
             parse_modrinth_supported_side(Some("unsupported"), Some("optional")),
             Some(ModSide::Server)
         );
+    }
+
+    #[test]
+    fn retryable_http_statuses_cover_common_transient_failures() {
+        assert!(should_retry_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(should_retry_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry_http_status(StatusCode::BAD_GATEWAY));
+        assert!(!should_retry_http_status(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn mcmod_security_verification_detection_matches_known_markers() {
+        assert!(mcmod_requires_security_verification(
+            "请先完成安全验证后继续访问"
+        ));
+        assert!(mcmod_requires_security_verification("页面需要人机验证"));
+        assert!(!mcmod_requires_security_verification("普通模组介绍页面"));
     }
 
     #[test]

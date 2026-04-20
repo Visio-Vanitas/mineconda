@@ -1126,6 +1126,29 @@ mod tests {
     }
 
     #[test]
+    fn detect_pack_format_rejects_non_mrpack_archives() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mineconda-non-mrpack-{unique}.zip"));
+        let file = File::create(&path).expect("failed to create temp zip");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zip.start_file("manifest.json", options)
+            .expect("failed to start manifest entry");
+        zip.write_all(br#"{"minecraft":{"version":"1.21.1"}}"#)
+            .expect("failed to write manifest");
+        zip.finish().expect("failed to finish zip");
+
+        let err = detect_pack_format(&path).expect_err("non-mrpack archive should be rejected");
+        assert!(
+            format!("{err:#}").contains("currently only Modrinth .mrpack is supported"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn import_pack_reads_manifest_lock_and_overrides() {
         let index = r#"{
             "formatVersion": 1,

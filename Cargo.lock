@@ -1107,6 +1107,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "terminal_size",
+ "toml",
  "unicode-width 0.2.0",
 ]
 

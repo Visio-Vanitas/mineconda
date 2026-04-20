@@ -8,7 +8,7 @@ It provides a manifest + lockfile workflow for reproducible modpack environments
 
 - **Reproducible**: `mineconda.toml` + `mineconda.lock`
 - **Fast workflow**: declarative add/remove, lock, sync
-- **Source flexibility**: Modrinth / CurseForge / mcmod search + URL / local / S3
+- **Source flexibility**: Modrinth / CurseForge / mcmod search + URL / local, with experimental S3 source/cache support
 - **Runtime-aware**: managed Java runtime via `mineconda env`
 - **Pack-ready**: import/export for common formats (currently strict `.mrpack` support)
 
@@ -20,6 +20,18 @@ The project is actively evolving. Core workflows are already usable:
 - `search` (interactive/non-interactive, install from results)
 - `lock`, `sync`, `cache`, `doctor`
 - `env`, `run`, `import`, `export`
+
+Stable baseline today:
+
+- `search` / `add` / `lock` / `sync` / `run`
+- `import` for Modrinth `.mrpack`
+- `export` for Modrinth `.mrpack`
+
+Compatibility / experimental areas:
+
+- `export --format curseforge`
+- `export --format multimc`
+- `[sources.s3]` and `[cache.s3]`
 
 ## Installation
 
@@ -84,9 +96,9 @@ Language selection:
   - `mineconda.toml` (desired state)
   - `mineconda.lock` (resolved reproducible state)
 - Optional S3 source:
-  - `[sources.s3]`
+  - `[sources.s3]` (experimental)
 - Optional S3 cache backend:
-  - `[cache.s3]`
+  - `[cache.s3]` (experimental)
 
 For full config details, use:
 

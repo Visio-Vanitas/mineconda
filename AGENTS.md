@@ -12,9 +12,10 @@ Primary capabilities implemented now:
 - sync lockfile packages to local `mods/` (`sync`, supports `--locked/--frozen/--offline/--jobs/--verbose-cache`)
 - manage Java runtime as environment (`env`)
 - run dev instance in client/server/both mode (`run`, loader-aware launcher autodetect)
-- export modpack format (`export`, improved metadata compatibility fields)
-- support project-level custom S3 mod source (`[sources.s3]` + `add --source s3`)
-- support project-level S3 mod cache backend (`[cache.s3]`, read-through + backfill on `sync`, `auth=auto|anonymous|sigv4`)
+- import/export Modrinth `.mrpack` as the stable modpack format path
+- export compatibility-oriented CurseForge/MultiMC metadata
+- support project-level experimental S3 mod source (`[sources.s3]` + `add --source s3`)
+- support project-level experimental S3 mod cache backend (`[cache.s3]`, read-through + backfill on `sync`, `auth=auto|anonymous|sigv4`)
 
 ## Workspace Structure
 - `crates/mineconda-cli`: CLI entry, command orchestration
@@ -72,14 +73,17 @@ CI workflow:
 - warmed-cache `sync --offline` restore path
 - optional `source=s3` + private `cache.s3(auth=sigv4)` + `cache remote-prune --s3` smoke via SSH+WSL MinIO (`MINECONDA_ENABLE_S3_SMOKE=1`)
 - `env install/use/list/which` managed Java runtime path
+- `doctor` managed runtime path plus non-blocking experimental S3 diagnostics
 - `ls --status --info`, `update`, `pin`, `cache` command chain
 - `sync` install path and lockfile metadata update
 - `sync --locked` reproducibility guard path
 - `run --dry-run` plus real `run` execution for `client`, `server`, `both`
 - explicit server `unix_args.txt` launch path for installed NeoForge-style servers
 - `export --format mrpack`, `export --format curseforge`, and `export --format mods-desc`
+- `export --format curseforge` compatibility warning path
 - exported `mrpack/curseforge` loader versions are resolved (not `latest`)
 - `import <mrpack>` auto-detect format path (`modrinth.index.json`) and strict mrpack import
+- `import` rejects non-`.mrpack` ZIP archives with explicit unsupported-format error
 - `import` supports local file + URL input; smoke validates both paths
 - imported `mrpack files[].path` non-`mods/` entries are persisted and installed by `sync` (offline cache path)
 
@@ -99,4 +103,5 @@ Smoke workspace:
 - optional WSL S3 smoke entry: `scripts/s3-smoke-wsl.sh`
 - real NeoForge server smoke entry: `scripts/actual-neoforge-server-smoke.sh`
 - S3 smoke is local/self-hosted only; CI baseline does not inject S3 smoke env
+- treat S3 as experimental in user-facing behavior and diagnostics unless explicitly validating that path
 - `cache remote-prune --s3` currently belongs to enhanced S3 smoke, not baseline smoke

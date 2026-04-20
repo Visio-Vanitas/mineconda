@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mineconda_core::{
     JavaProvider, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
-    RuntimeProfile, S3CacheAuth, ServerProfile, lockfile_path, manifest_path, read_lockfile,
-    read_manifest, write_lockfile, write_manifest,
+    RuntimeProfile, S3CacheAuth, S3CacheConfig, S3SourceConfig, ServerProfile, lockfile_path,
+    manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
 };
 use mineconda_export::{
     ExportFormat, ExportRequest, ImportFormat as PackImportFormat, ImportRequest, ImportSide,
@@ -322,6 +322,15 @@ enum ExportArg {
 }
 
 impl ExportArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Curseforge => "curseforge",
+            Self::Mrpack => "mrpack",
+            Self::Multimc => "multimc",
+            Self::ModsDesc => "mods-desc",
+        }
+    }
+
     fn to_core(self) -> ExportFormat {
         match self {
             Self::Curseforge => ExportFormat::CurseforgeZip,
@@ -1773,6 +1782,227 @@ impl DoctorCounts {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorFinding {
+    level: DoctorLevel,
+    title: &'static str,
+    detail: String,
+}
+
+impl DoctorFinding {
+    fn new(level: DoctorLevel, title: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            level,
+            title,
+            detail: detail.into(),
+        }
+    }
+}
+
+fn collect_s3_doctor_findings<F>(manifest: &Manifest, mut has_env: F) -> Vec<DoctorFinding>
+where
+    F: FnMut(&str) -> bool,
+{
+    let has_s3_source_mods = manifest
+        .mods
+        .iter()
+        .any(|entry| entry.source == ModSource::S3);
+    let Some(s3_cache) = manifest.cache.s3.as_ref() else {
+        if !has_s3_source_mods {
+            return Vec::new();
+        }
+        let mut findings = Vec::new();
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Ok,
+            "s3 status",
+            "experimental feature; not part of the stable baseline",
+        ));
+        findings.extend(collect_s3_source_doctor_findings(
+            manifest.sources.s3.as_ref(),
+            has_s3_source_mods,
+        ));
+        return findings;
+    };
+
+    let mut findings = vec![DoctorFinding::new(
+        DoctorLevel::Ok,
+        "s3 status",
+        "experimental feature; not part of the stable baseline",
+    )];
+    findings.extend(collect_s3_source_doctor_findings(
+        manifest.sources.s3.as_ref(),
+        has_s3_source_mods,
+    ));
+    findings.extend(collect_s3_cache_doctor_findings(s3_cache, &mut has_env));
+    findings
+}
+
+fn collect_s3_source_doctor_findings(
+    source: Option<&S3SourceConfig>,
+    has_s3_source_mods: bool,
+) -> Vec<DoctorFinding> {
+    if !has_s3_source_mods {
+        return Vec::new();
+    }
+
+    let finding = match source {
+        Some(s3) if !s3.bucket.trim().is_empty() => {
+            let mut detail = format!("bucket={}", s3.bucket);
+            if let Some(prefix) = s3
+                .key_prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                detail.push_str(&format!(" prefix={prefix}"));
+            }
+            DoctorFinding::new(DoctorLevel::Ok, "s3 source config", detail)
+        }
+        _ => DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 source config",
+            "mods use source=s3 but [sources.s3] is missing/invalid",
+        ),
+    };
+
+    vec![finding]
+}
+
+fn collect_s3_cache_doctor_findings<F>(
+    s3_cache: &S3CacheConfig,
+    mut has_env: F,
+) -> Vec<DoctorFinding>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut findings = Vec::new();
+
+    if !s3_cache.enabled {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Ok,
+            "s3 cache config",
+            "configured but disabled",
+        ));
+    } else if s3_cache.bucket.trim().is_empty() {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache config",
+            "cache.s3.enabled=true but bucket is empty",
+        ));
+    } else {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Ok,
+            "s3 cache config",
+            format!("enabled bucket={}", s3_cache.bucket),
+        ));
+    }
+
+    findings.push(DoctorFinding::new(
+        DoctorLevel::Ok,
+        "s3 cache auth",
+        format!("mode={}", s3_cache.auth.as_str()),
+    ));
+
+    if s3_cache
+        .public_base_url
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && s3_cache
+            .endpoint
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache endpoint",
+            "public_base_url and endpoint are both set; public_base_url will be used first",
+        ));
+    }
+
+    if matches!(s3_cache.auth, S3CacheAuth::Sigv4)
+        && s3_cache
+            .public_base_url
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache auth",
+            "sigv4 ignores public_base_url for signed requests; prefer endpoint/path_style",
+        ));
+    }
+
+    for (field, name) in [
+        ("access_key_env", s3_cache.access_key_env.as_deref()),
+        ("secret_key_env", s3_cache.secret_key_env.as_deref()),
+        ("session_token_env", s3_cache.session_token_env.as_deref()),
+    ] {
+        let Some(name) = name else {
+            continue;
+        };
+
+        if name.trim().is_empty() {
+            findings.push(DoctorFinding::new(
+                DoctorLevel::Warn,
+                "s3 cache credential",
+                format!("cache.s3.{field} is empty"),
+            ));
+        } else if has_env(name) {
+            findings.push(DoctorFinding::new(
+                DoctorLevel::Ok,
+                "s3 cache credential",
+                format!("{name} is set"),
+            ));
+        } else {
+            findings.push(DoctorFinding::new(
+                DoctorLevel::Warn,
+                "s3 cache credential",
+                format!("{name} is not set"),
+            ));
+        }
+    }
+
+    let has_access = s3_cache
+        .access_key_env
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_secret = s3_cache
+        .secret_key_env
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_access ^ has_secret {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache credential",
+            "access_key_env and secret_key_env should be configured together",
+        ));
+    }
+
+    if matches!(s3_cache.auth, S3CacheAuth::Sigv4) && !(has_access && has_secret) {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache auth",
+            "cache.s3.auth=sigv4 expects access_key_env and secret_key_env",
+        ));
+    }
+
+    if matches!(s3_cache.auth, S3CacheAuth::Sigv4)
+        && s3_cache
+            .region
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+    {
+        findings.push(DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 cache auth",
+            "cache.s3.auth=sigv4 will default region to us-east-1",
+        ));
+    }
+
+    findings
+}
+
 fn cmd_doctor(root: &Path, strict: bool, no_color: bool) -> Result<()> {
     let use_color =
         std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() && !no_color;
@@ -1896,228 +2126,14 @@ fn cmd_doctor(root: &Path, strict: bool, no_color: bool) -> Result<()> {
             }
         }
 
-        let has_s3 = manifest
-            .mods
-            .iter()
-            .any(|entry| entry.source == ModSource::S3);
-        if has_s3 {
-            match manifest.sources.s3.as_ref() {
-                Some(s3) if !s3.bucket.trim().is_empty() => {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Ok,
-                        "s3 source config",
-                        format!("bucket={}", s3.bucket),
-                        use_color,
-                    );
-                }
-                _ => {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Fail,
-                        "s3 source config",
-                        "mods use source=s3 but [sources.s3] is missing/invalid".to_string(),
-                        use_color,
-                    );
-                }
-            }
-        }
-
-        if let Some(s3_cache) = manifest.cache.s3.as_ref() {
-            if !s3_cache.enabled {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Ok,
-                    "s3 cache config",
-                    "configured but disabled".to_string(),
-                    use_color,
-                );
-            } else if s3_cache.bucket.trim().is_empty() {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Fail,
-                    "s3 cache config",
-                    "cache.s3.enabled=true but bucket is empty".to_string(),
-                    use_color,
-                );
-            } else {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Ok,
-                    "s3 cache config",
-                    format!("enabled bucket={}", s3_cache.bucket),
-                    use_color,
-                );
-            }
-
+        for finding in collect_s3_doctor_findings(manifest, |name| env::var_os(name).is_some()) {
             doctor_log(
                 &mut counts,
-                DoctorLevel::Ok,
-                "s3 cache auth",
-                format!("mode={}", s3_cache.auth.as_str()),
+                finding.level,
+                finding.title,
+                finding.detail,
                 use_color,
             );
-
-            if s3_cache
-                .public_base_url
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-                && s3_cache
-                    .endpoint
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty())
-            {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Warn,
-                    "s3 cache endpoint",
-                    "public_base_url and endpoint are both set; public_base_url will be used first"
-                        .to_string(),
-                    use_color,
-                );
-            }
-
-            if matches!(s3_cache.auth, S3CacheAuth::Sigv4)
-                && s3_cache
-                    .public_base_url
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty())
-            {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Warn,
-                    "s3 cache auth",
-                    "sigv4 ignores public_base_url for signed requests; prefer endpoint/path_style"
-                        .to_string(),
-                    use_color,
-                );
-            }
-
-            if let Some(name) = s3_cache.access_key_env.as_deref() {
-                if name.trim().is_empty() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        "cache.s3.access_key_env is empty".to_string(),
-                        use_color,
-                    );
-                } else if env::var_os(name).is_some() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Ok,
-                        "s3 cache credential",
-                        format!("{name} is set"),
-                        use_color,
-                    );
-                } else {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        format!("{name} is not set"),
-                        use_color,
-                    );
-                }
-            }
-            if let Some(name) = s3_cache.secret_key_env.as_deref() {
-                if name.trim().is_empty() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        "cache.s3.secret_key_env is empty".to_string(),
-                        use_color,
-                    );
-                } else if env::var_os(name).is_some() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Ok,
-                        "s3 cache credential",
-                        format!("{name} is set"),
-                        use_color,
-                    );
-                } else {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        format!("{name} is not set"),
-                        use_color,
-                    );
-                }
-            }
-            if let Some(name) = s3_cache.session_token_env.as_deref() {
-                if name.trim().is_empty() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        "cache.s3.session_token_env is empty".to_string(),
-                        use_color,
-                    );
-                } else if env::var_os(name).is_some() {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Ok,
-                        "s3 cache credential",
-                        format!("{name} is set"),
-                        use_color,
-                    );
-                } else {
-                    doctor_log(
-                        &mut counts,
-                        DoctorLevel::Warn,
-                        "s3 cache credential",
-                        format!("{name} is not set"),
-                        use_color,
-                    );
-                }
-            }
-
-            let has_access = s3_cache
-                .access_key_env
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            let has_secret = s3_cache
-                .secret_key_env
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
-            if has_access ^ has_secret {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Warn,
-                    "s3 cache credential",
-                    "access_key_env and secret_key_env should be configured together".to_string(),
-                    use_color,
-                );
-            }
-
-            if matches!(s3_cache.auth, S3CacheAuth::Sigv4) && !(has_access && has_secret) {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Fail,
-                    "s3 cache auth",
-                    "cache.s3.auth=sigv4 requires access_key_env and secret_key_env".to_string(),
-                    use_color,
-                );
-            }
-
-            if matches!(s3_cache.auth, S3CacheAuth::Sigv4)
-                && s3_cache
-                    .region
-                    .as_deref()
-                    .map(str::trim)
-                    .is_none_or(|value| value.is_empty())
-            {
-                doctor_log(
-                    &mut counts,
-                    DoctorLevel::Warn,
-                    "s3 cache auth",
-                    "cache.s3.auth=sigv4 will default region to us-east-1".to_string(),
-                    use_color,
-                );
-            }
         }
 
         if manifest.server.java != "java" {
@@ -2602,6 +2618,12 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
 fn cmd_export(root: &Path, format: ExportArg, output: PathBuf) -> Result<()> {
     let mut manifest = load_manifest(root)?;
     let mut lock = load_lockfile_required(root)?;
+    if matches!(format, ExportArg::Curseforge | ExportArg::Multimc) {
+        eprintln!(
+            "warning: `{}` export is compatibility-oriented and not part of the stable import/export baseline; validate it with your target launcher",
+            format.as_str()
+        );
+    }
     let resolved_loader_version = resolve_loader_version(
         &manifest.project.minecraft,
         manifest.project.loader.kind,
@@ -2754,7 +2776,7 @@ fn prepare_import_input(input: &str) -> Result<PreparedImportInput> {
 
 fn build_import_http_client() -> Result<Client> {
     let mut builder = Client::builder()
-        .user_agent("mineconda/0.1.0 (+https://github.com/placeholder/mineconda)")
+        .user_agent(mineconda_core::http_user_agent())
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(120));
 
@@ -3085,13 +3107,15 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use mineconda_core::{LockedPackage, ModSide, ModSource, RuntimeProfile, ServerProfile};
+    use mineconda_core::{
+        LockedPackage, Manifest, ModSide, ModSource, RuntimeProfile, ServerProfile,
+    };
     use mineconda_resolver::{SearchResult, SearchSource};
 
     use super::{
-        display_width, extract_curseforge_project_id, extract_modrinth_slug,
-        lock_package_matches_request, resolve_java_for_run, resolve_search_install_target,
-        truncate_visual, wrap_visual,
+        DoctorLevel, collect_s3_doctor_findings, display_width, extract_curseforge_project_id,
+        extract_modrinth_slug, lock_package_matches_request, resolve_java_for_run,
+        resolve_search_install_target, truncate_visual, wrap_visual,
     };
 
     #[test]
@@ -3202,5 +3226,96 @@ mod tests {
         let runtime = RuntimeProfile::default();
         let java = resolve_java_for_run(None, &server, Some(&runtime)).unwrap();
         assert_eq!(java, "/opt/java/bin/java");
+    }
+
+    #[test]
+    fn s3_doctor_findings_remain_non_blocking_for_experimental_config() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "iris"
+source = "s3"
+version = "packs/dev/iris.jar"
+side = "both"
+
+[cache.s3]
+enabled = true
+bucket = ""
+auth = "sigv4"
+access_key_env = "ACCESS_KEY"
+"#,
+        )
+        .expect("manifest should parse");
+
+        let findings = collect_s3_doctor_findings(&manifest, |_| false);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.level != DoctorLevel::Fail)
+        );
+        assert!(findings.iter().any(
+            |finding| finding.title == "s3 source config" && finding.level == DoctorLevel::Warn
+        ));
+        assert!(findings.iter().any(
+            |finding| finding.title == "s3 cache config" && finding.level == DoctorLevel::Warn
+        ));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "s3 status" && finding.level == DoctorLevel::Ok)
+        );
+    }
+
+    #[test]
+    fn s3_doctor_findings_report_env_presence_and_experimental_status() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[sources.s3]
+bucket = "mods"
+key_prefix = "packs/dev"
+
+[cache.s3]
+enabled = true
+bucket = "mods-cache"
+auth = "auto"
+access_key_env = "ACCESS_KEY"
+secret_key_env = "SECRET_KEY"
+"#,
+        )
+        .expect("manifest should parse");
+
+        let findings = collect_s3_doctor_findings(&manifest, |name| name == "ACCESS_KEY");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.title == "s3 status"
+                    && finding.detail.contains("experimental"))
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.detail == "ACCESS_KEY is set")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.detail == "SECRET_KEY is not set")
+        );
     }
 }

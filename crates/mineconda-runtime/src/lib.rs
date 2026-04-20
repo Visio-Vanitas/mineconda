@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use mineconda_core::JavaProvider;
+use mineconda_core::{JavaProvider, http_user_agent};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
@@ -196,7 +196,7 @@ pub fn list_java_runtimes() -> Result<Vec<InstalledJavaRuntime>> {
 fn install_from_adoptium(version: &str, install_dir: &Path) -> Result<()> {
     let (os, arch) = platform()?;
     let client = Client::builder()
-        .user_agent("mineconda/0.1.0")
+        .user_agent(http_user_agent())
         .build()
         .context("failed to build HTTP client")?;
 

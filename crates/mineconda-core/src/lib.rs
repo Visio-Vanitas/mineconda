@@ -8,6 +8,14 @@ use thiserror::Error;
 pub const MANIFEST_FILE: &str = "mineconda.toml";
 pub const LOCK_FILE: &str = "mineconda.lock";
 pub const LOCK_GENERATOR: &str = "mineconda/0.1.0";
+pub const REPOSITORY_URL: &str = "https://github.com/Visio-Vanitas/mineconda";
+
+pub fn http_user_agent() -> String {
+    format!(
+        "mineconda/{} (+{REPOSITORY_URL})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -559,7 +567,7 @@ fn sanitize_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, S3CacheAuth};
+    use super::{Manifest, REPOSITORY_URL, S3CacheAuth, http_user_agent};
 
     #[test]
     fn s3_cache_auth_defaults_to_auto() {
@@ -630,5 +638,12 @@ upload_enabled = false
         assert_eq!(cache.auth, S3CacheAuth::Auto);
         assert!(cache.path_style);
         assert!(!cache.upload_enabled);
+    }
+
+    #[test]
+    fn http_user_agent_uses_public_repository_url() {
+        let value = http_user_agent();
+        assert!(value.starts_with("mineconda/"));
+        assert!(value.contains(REPOSITORY_URL));
     }
 }
