@@ -1457,6 +1457,7 @@ mod tests {
                 side: ModSide::Both,
             }],
             groups: Default::default(),
+            profiles: Default::default(),
             sources: SourceRegistry::default(),
             cache: Default::default(),
             server: ServerProfile::default(),

@@ -69,13 +69,14 @@ mineconda run --mode client --dry-run
 ## CLI 概览
 
 ```text
-mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
+mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 ```
 
 主要命令：
 
 - `init` / `add` / `remove` / `ls`
 - `group` / `tree` / `why`
+- `profile` / `workspace`
 - `search` / `update` / `pin` / `lock` / `status`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
@@ -86,6 +87,7 @@ mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 - `mineconda lock diff`：只预览锁文件变化，不写回
 - `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
 - 两个命令都支持 `--json`，可用于脚本集成，并保持稳定的 `0/2/1` 退出码
+- `mineconda ls --json`、`mineconda tree --json`、`mineconda why <id> --json` 可输出结构化依赖数据
 
 ## Dependency Groups
 
@@ -154,6 +156,83 @@ mineconda run --mode client --group client
 - `lock`、`sync`、`tree`、`why`、`run`、`export` 都支持 `--group` / `--all-groups`
 - 旧锁文件可能没有 group metadata；如果命令要求，请重新执行一次 `mineconda lock`
 - `run --mode client|server|both` 不会自动选择组，组激活始终是显式行为
+
+## Profiles
+
+Profile 是一组 group 选择的命名别名，用来减少重复输入，适合日常开发和调试场景。
+
+示例：
+
+```toml
+[profiles.client-dev]
+groups = ["client", "dev"]
+```
+
+用法：
+
+```bash
+mineconda profile add client-dev --group client --group dev
+mineconda sync --profile client-dev
+mineconda run --profile client-dev --mode client
+mineconda tree --profile client-dev
+```
+
+规则：
+
+- 项目级 profile 写在 `mineconda.toml`
+- workspace 级 profile 写在 `mineconda-workspace.toml`
+- member 本地 profile 会覆盖同名 workspace profile
+- `--profile` 和 `--group` 会合并，`default` 仍然始终激活
+
+## Workspace
+
+`mineconda` 支持在一个 workspace 根目录下管理多个整合包 member。
+
+workspace 文件示例：
+
+```toml
+members = ["packs/client", "packs/server"]
+
+[workspace]
+name = "demo"
+
+[profiles.client-dev]
+groups = ["client", "dev"]
+```
+
+常见工作流：
+
+```bash
+mineconda workspace init demo
+mineconda workspace add packs/client
+mineconda workspace add packs/server
+
+mineconda --member client init client-pack --minecraft 1.21.1 --loader neoforge
+mineconda --member client add jei
+mineconda --member client lock
+
+mineconda --all-members status
+mineconda --all-members lock diff --json
+```
+
+当前边界：
+
+- 每个 member 仍各自维护 `mineconda.toml` 和 `mineconda.lock`
+- 目前支持 `status` 和 `lock diff` 的 `--all-members` 聚合
+- `add`、`remove`、`sync`、`run`、`export` 这类会改动或执行的命令仍要求显式 `--member`
+
+## JSON 输出
+
+当前支持结构化 JSON 输出的命令：
+
+- `mineconda lock diff --json`
+- `mineconda status --json`
+- `mineconda ls --json`
+- `mineconda tree --json`
+- `mineconda why <id> --json`
+
+在 workspace 根目录配合 `--all-members` 使用时，`status --json` 和 `lock diff --json`
+会返回按 member 聚合的结果以及对应退出码。
 
 ## 搜索交互
 

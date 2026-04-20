@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +14,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mineconda_core::{
     DEFAULT_GROUP_NAME, JavaProvider, LoaderKind, LockedDependency, LockedDependencyKind,
     LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec, RuntimeProfile, S3CacheAuth,
-    S3CacheConfig, S3SourceConfig, ServerProfile, is_default_group_name, is_valid_group_name,
-    lockfile_path, manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
+    S3CacheConfig, S3SourceConfig, ServerProfile, WORKSPACE_FILE, WorkspaceConfig,
+    is_default_group_name, is_valid_group_name, is_valid_profile_name, lockfile_path,
+    manifest_path, read_lockfile, read_manifest, read_workspace, workspace_path, write_lockfile,
+    write_manifest, write_workspace,
 };
 use mineconda_export::{
     ExportFormat, ExportRequest, ImportFormat as PackImportFormat, ImportRequest, ImportSide,
@@ -49,6 +51,14 @@ mod search_tui;
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
+    #[arg(long, global = true)]
+    workspace: bool,
+    #[arg(long, global = true)]
+    member: Option<String>,
+    #[arg(long, global = true)]
+    all_members: bool,
+    #[arg(long = "profile", global = true)]
+    profiles: Vec<String>,
     #[arg(long, global = true)]
     no_color: bool,
     #[arg(long, global = true, value_enum, default_value_t = LangArg::Auto)]
@@ -98,6 +108,14 @@ enum Commands {
         #[command(subcommand)]
         command: GroupCommands,
     },
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
     Ls {
         #[arg(long)]
         status: bool,
@@ -107,6 +125,8 @@ enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        json: bool,
     },
     Search {
         query: String,
@@ -137,6 +157,8 @@ enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        json: bool,
     },
     Why {
         id: String,
@@ -146,6 +168,8 @@ enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        json: bool,
     },
     #[command(visible_alias = "upgrade")]
     Update {
@@ -298,6 +322,27 @@ enum GroupCommands {
         #[arg(long)]
         no_lock: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileCommands {
+    Ls,
+    Add {
+        name: String,
+        #[arg(long = "group", required = true)]
+        groups: Vec<String>,
+    },
+    Remove {
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCommands {
+    Init { name: String },
+    Ls,
+    Add { path: String },
+    Remove { path: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -552,6 +597,76 @@ struct SearchCommandArgs {
     group: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ScopeArgs {
+    workspace: bool,
+    member: Option<String>,
+    all_members: bool,
+    profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectTarget {
+    root: PathBuf,
+    workspace: Option<WorkspaceConfig>,
+    member_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceMemberTarget {
+    name: String,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectSelection<'a> {
+    groups: &'a [String],
+    all_groups: bool,
+    profiles: &'a [String],
+    workspace: Option<&'a WorkspaceConfig>,
+    member_name: Option<&'a str>,
+}
+
+impl<'a> ProjectSelection<'a> {
+    fn active_groups(self, manifest: &Manifest) -> Result<BTreeSet<String>> {
+        activation_groups_with_profiles(
+            manifest,
+            self.workspace,
+            self.groups,
+            self.all_groups,
+            self.profiles,
+        )
+    }
+
+    fn fallback_groups(self) -> Vec<String> {
+        requested_groups_fallback(self.groups, self.all_groups)
+    }
+
+    fn normalized_profiles(self) -> Result<Vec<String>> {
+        normalized_profile_names(self.profiles)
+    }
+
+    fn workspace_name(self) -> Option<String> {
+        self.workspace.map(|item| item.workspace.name.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TreeCommandArgs {
+    id: Option<String>,
+    invert: Option<String>,
+    all: bool,
+    source: Option<SourceArg>,
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WhyCommandArgs {
+    id: String,
+    source: Option<SourceArg>,
+    json: bool,
+}
+
 #[derive(Debug)]
 struct SyncCommandArgs {
     prune: bool,
@@ -737,6 +852,108 @@ struct StatusJsonReport {
     messages: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LsJsonSummary {
+    roots: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LsJsonItem {
+    group: String,
+    id: String,
+    source: String,
+    requested_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locked_version: Option<String>,
+    status: String,
+    install_path: String,
+    side: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LsJsonReport {
+    command: &'static str,
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member: Option<String>,
+    summary: LsJsonSummary,
+    items: Vec<LsJsonItem>,
+    messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TreeJsonNode {
+    key: String,
+    id: String,
+    source: String,
+    version: String,
+    groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TreeJsonEdge {
+    from: String,
+    to: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TreeJsonReport {
+    command: &'static str,
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member: Option<String>,
+    mode: String,
+    direction: String,
+    roots: Vec<String>,
+    nodes: Vec<TreeJsonNode>,
+    edges: Vec<TreeJsonEdge>,
+    messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WhyJsonStep {
+    key: String,
+    id: String,
+    source: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WhyJsonTarget {
+    key: String,
+    id: String,
+    source: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WhyJsonReport {
+    command: &'static str,
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member: Option<String>,
+    target: WhyJsonTarget,
+    reason: String,
+    direct: bool,
+    paths: Vec<Vec<WhyJsonStep>>,
+    messages: Vec<String>,
+}
+
 fn normalize_group_selector(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -757,6 +974,230 @@ fn normalize_named_group(raw: &str) -> Result<String> {
         bail!("`default` is the built-in root group and cannot be created or removed");
     }
     Ok(group)
+}
+
+fn normalize_profile_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("profile name must not be empty");
+    }
+    if !is_valid_profile_name(trimmed) {
+        bail!("invalid profile name `{trimmed}` (expected lowercase kebab-case)");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_member_entry(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("member path must not be empty");
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        bail!("workspace member path must be relative");
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::ParentDir => {
+                bail!("workspace member path must not escape the workspace root")
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("workspace member path must be relative")
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        bail!("member path must not be empty");
+    }
+
+    Ok(parts.join("/"))
+}
+
+fn profile_groups_for_selection(
+    manifest: &Manifest,
+    workspace: Option<&WorkspaceConfig>,
+    profiles: &[String],
+) -> Result<Vec<String>> {
+    let mut groups = Vec::new();
+    for raw in profiles {
+        let profile = normalize_profile_name(raw)?;
+        let spec = manifest
+            .profile(&profile)
+            .or_else(|| workspace.and_then(|item| item.profiles.0.get(&profile)))
+            .with_context(|| format!("profile `{profile}` not found"))?;
+        groups.extend(spec.groups.iter().cloned());
+    }
+    Ok(groups)
+}
+
+fn activation_groups_with_profiles(
+    manifest: &Manifest,
+    workspace: Option<&WorkspaceConfig>,
+    requested: &[String],
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<BTreeSet<String>> {
+    let mut combined = profile_groups_for_selection(manifest, workspace, profiles)?;
+    combined.extend(requested.iter().cloned());
+    activation_groups(manifest, &combined, all_groups)
+}
+
+fn validate_manifest_profiles(manifest: &Manifest) -> Result<()> {
+    for (name, profile) in &manifest.profiles.0 {
+        if !is_valid_profile_name(name) {
+            bail!("manifest contains invalid profile name `{name}`");
+        }
+        for group in &profile.groups {
+            normalize_group_selector(group).with_context(|| {
+                format!("manifest profile `{name}` contains invalid group selector `{group}`")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_config(workspace: &WorkspaceConfig) -> Result<()> {
+    if workspace.workspace.name.trim().is_empty() {
+        bail!("workspace name must not be empty");
+    }
+    for member in workspace.member_entries() {
+        normalize_member_entry(member)
+            .with_context(|| format!("workspace contains invalid member `{member}`"))?;
+    }
+    for (name, profile) in &workspace.profiles.0 {
+        if !is_valid_profile_name(name) {
+            bail!("workspace contains invalid profile name `{name}`");
+        }
+        for group in &profile.groups {
+            normalize_group_selector(group).with_context(|| {
+                format!("workspace profile `{name}` contains invalid group selector `{group}`")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn load_workspace_optional(root: &Path) -> Result<Option<WorkspaceConfig>> {
+    let path = workspace_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut workspace =
+        read_workspace(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    if workspace.members.is_empty() && !workspace.workspace.members.is_empty() {
+        workspace.members = workspace.workspace.members.clone();
+        workspace.workspace.members.clear();
+    }
+    validate_workspace_config(&workspace)?;
+    Ok(Some(workspace))
+}
+
+fn load_workspace_required(root: &Path) -> Result<WorkspaceConfig> {
+    load_workspace_optional(root)?.with_context(|| {
+        format!(
+            "workspace not found, expected {}",
+            workspace_path(root).display()
+        )
+    })
+}
+
+fn workspace_member_target(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+    selector: &str,
+) -> Result<WorkspaceMemberTarget> {
+    let exact = normalize_member_entry(selector).ok();
+    if let Some(exact) = exact {
+        if workspace
+            .member_entries()
+            .iter()
+            .any(|member| member == &exact)
+        {
+            return Ok(WorkspaceMemberTarget {
+                name: exact.clone(),
+                root: workspace_root.join(&exact),
+            });
+        }
+    }
+
+    let selector = selector.trim();
+    let mut matches = workspace
+        .member_entries()
+        .iter()
+        .filter(|member| {
+            Path::new(member)
+                .file_name()
+                .map(|value| value == selector)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+
+    match matches.as_slice() {
+        [member] => Ok(WorkspaceMemberTarget {
+            name: member.clone(),
+            root: workspace_root.join(member),
+        }),
+        [] => bail!("workspace member `{selector}` not found"),
+        _ => bail!(
+            "workspace member `{selector}` is ambiguous; use one of: {}",
+            matches.join(", ")
+        ),
+    }
+}
+
+fn workspace_members(
+    workspace_root: &Path,
+    workspace: &WorkspaceConfig,
+) -> Result<Vec<WorkspaceMemberTarget>> {
+    workspace
+        .member_entries()
+        .iter()
+        .map(|member| {
+            Ok(WorkspaceMemberTarget {
+                name: normalize_member_entry(member)?,
+                root: workspace_root.join(member),
+            })
+        })
+        .collect()
+}
+
+fn resolve_project_target(root: &Path, scope: &ScopeArgs) -> Result<ProjectTarget> {
+    let workspace = load_workspace_optional(root)?;
+    match workspace {
+        Some(workspace) => {
+            let member = scope.member.as_deref().with_context(|| {
+                "workspace root requires --member for this command; use `--all-members` where supported"
+            })?;
+            let target = workspace_member_target(root, &workspace, member)?;
+            Ok(ProjectTarget {
+                root: target.root,
+                workspace: Some(workspace),
+                member_name: Some(target.name),
+            })
+        }
+        None => {
+            if scope.workspace {
+                bail!("{} does not contain {}", root.display(), WORKSPACE_FILE);
+            }
+            if scope.member.is_some() || scope.all_members {
+                bail!("--member/--all-members require a workspace root");
+            }
+            Ok(ProjectTarget {
+                root: root.to_path_buf(),
+                workspace: None,
+                member_name: None,
+            })
+        }
+    }
 }
 
 fn target_group_name(group: Option<String>) -> Result<String> {
@@ -915,6 +1356,13 @@ fn requested_groups_fallback(groups: &[String], all_groups: bool) -> Vec<String>
         }
     }
     out.into_iter().collect()
+}
+
+fn normalized_profile_names(profiles: &[String]) -> Result<Vec<String>> {
+    profiles
+        .iter()
+        .map(|profile| normalize_profile_name(profile))
+        .collect()
 }
 
 fn normalized_package_groups(package: &LockedPackage) -> Vec<String> {
@@ -1232,17 +1680,36 @@ fn render_lock_diff_entry(entry: &LockDiffEntry) -> String {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root;
+    let scope = ScopeArgs {
+        workspace: cli.workspace,
+        member: cli.member,
+        all_members: cli.all_members,
+        profiles: cli.profiles,
+    };
     let no_color = cli.no_color;
     i18n::init(cli.lang.to_preference());
 
     match cli.command {
+        Commands::Workspace { command } => cmd_workspace(&root, command)?,
+        Commands::Profile { command } => cmd_profile(&root, command, &scope)?,
         Commands::Init {
             name,
             minecraft,
             loader,
             loader_version,
             bare,
-        } => cmd_init(&root, name, minecraft, loader, loader_version, bare)?,
+        } => {
+            let target_root = if load_workspace_optional(&root)?.is_some() {
+                let member = scope.member.as_deref().with_context(
+                    || "workspace root requires --member to initialize a member project",
+                )?;
+                let workspace = load_workspace_required(&root)?;
+                workspace_member_target(&root, &workspace, member)?.root
+            } else {
+                root.clone()
+            };
+            cmd_init(&target_root, name, minecraft, loader, loader_version, bare)?
+        }
         Commands::Add {
             id,
             source,
@@ -1250,21 +1717,41 @@ fn main() -> Result<()> {
             side,
             group,
             no_lock,
-        } => cmd_add(&root, id, source, version, side, group, no_lock)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_add(&target.root, id, source, version, side, group, no_lock)?
+        }
         Commands::Remove {
             id,
             source,
             group,
             all_groups,
             no_lock,
-        } => cmd_remove(&root, &id, source, group, all_groups, no_lock)?,
-        Commands::Group { command } => cmd_group(&root, command)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_remove(&target.root, &id, source, group, all_groups, no_lock)?
+        }
+        Commands::Group { command } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_group(&target.root, command)?
+        }
         Commands::Ls {
             status,
             info,
             groups,
             all_groups,
-        } => cmd_ls(&root, status, info, groups, all_groups, no_color)?,
+            json,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            let selection = ProjectSelection {
+                groups: &groups,
+                all_groups,
+                profiles: &scope.profiles,
+                workspace: target.workspace.as_ref(),
+                member_name: target.member_name.as_deref(),
+            };
+            cmd_ls(&target.root, status, info, no_color, json, selection)?
+        }
         Commands::Search {
             query,
             source,
@@ -1274,20 +1761,23 @@ fn main() -> Result<()> {
             install_first,
             install_version,
             group,
-        } => cmd_search(
-            &root,
-            SearchCommandArgs {
-                query,
-                source,
-                limit,
-                page,
-                no_color,
-                non_interactive,
-                install_first,
-                install_version,
-                group,
-            },
-        )?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_search(
+                &target.root,
+                SearchCommandArgs {
+                    query,
+                    source,
+                    limit,
+                    page,
+                    no_color,
+                    non_interactive,
+                    install_first,
+                    install_version,
+                    group,
+                },
+            )?
+        }
         Commands::Tree {
             id,
             invert,
@@ -1295,13 +1785,45 @@ fn main() -> Result<()> {
             source,
             groups,
             all_groups,
-        } => cmd_tree(&root, id, invert, all, source, groups, all_groups)?,
+            json,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            let selection = ProjectSelection {
+                groups: &groups,
+                all_groups,
+                profiles: &scope.profiles,
+                workspace: target.workspace.as_ref(),
+                member_name: target.member_name.as_deref(),
+            };
+            cmd_tree(
+                &target.root,
+                TreeCommandArgs {
+                    id,
+                    invert,
+                    all,
+                    source,
+                    json,
+                },
+                selection,
+            )?
+        }
         Commands::Why {
             id,
             source,
             groups,
             all_groups,
-        } => cmd_why(&root, &id, source, groups, all_groups)?,
+            json,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            let selection = ProjectSelection {
+                groups: &groups,
+                all_groups,
+                profiles: &scope.profiles,
+                workspace: target.workspace.as_ref(),
+                member_name: target.member_name.as_deref(),
+            };
+            cmd_why(&target.root, WhyCommandArgs { id, source, json }, selection)?
+        }
         Commands::Update {
             id,
             source,
@@ -1309,7 +1831,10 @@ fn main() -> Result<()> {
             groups,
             all_groups,
             no_lock,
-        } => cmd_update(&root, id, source, to, groups, all_groups, no_lock)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_update(&target.root, id, source, to, groups, all_groups, no_lock)?
+        }
         Commands::Pin {
             id,
             source,
@@ -1317,7 +1842,18 @@ fn main() -> Result<()> {
             groups,
             all_groups,
             no_lock,
-        } => cmd_pin(&root, id, source, version, groups, all_groups, no_lock)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_pin(
+                &target.root,
+                id,
+                source,
+                version,
+                groups,
+                all_groups,
+                no_lock,
+            )?
+        }
         Commands::Lock {
             command,
             upgrade,
@@ -1325,17 +1861,65 @@ fn main() -> Result<()> {
             all_groups,
         } => match command {
             Some(LockCommands::Diff { json }) => {
-                cmd_lock_diff(&root, upgrade, groups, all_groups, json)?
+                let workspace = load_workspace_optional(&root)?;
+                if workspace.is_some() && scope.all_members {
+                    cmd_lock_diff_workspace(
+                        &root,
+                        upgrade,
+                        groups,
+                        all_groups,
+                        &scope.profiles,
+                        json,
+                    )?
+                } else {
+                    let target = resolve_project_target(&root, &scope)?;
+                    let selection = ProjectSelection {
+                        groups: &groups,
+                        all_groups,
+                        profiles: &scope.profiles,
+                        workspace: target.workspace.as_ref(),
+                        member_name: target.member_name.as_deref(),
+                    };
+                    cmd_lock_diff(&target.root, upgrade, json, selection)?
+                }
             }
-            None => cmd_lock(&root, upgrade, groups, all_groups)?,
+            None => {
+                let target = resolve_project_target(&root, &scope)?;
+                cmd_lock(
+                    &target.root,
+                    upgrade,
+                    groups,
+                    all_groups,
+                    &scope.profiles,
+                    target.workspace.as_ref(),
+                )?
+            }
         },
         Commands::Status {
             groups,
             all_groups,
             json,
-        } => cmd_status(&root, groups, all_groups, json)?,
-        Commands::Cache { command } => cmd_cache(&root, command)?,
-        Commands::Env { command } => cmd_env(&root, command)?,
+        } => {
+            let workspace = load_workspace_optional(&root)?;
+            if workspace.is_some() && scope.all_members {
+                cmd_status_workspace(&root, groups, all_groups, &scope.profiles, json)?
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                let selection = ProjectSelection {
+                    groups: &groups,
+                    all_groups,
+                    profiles: &scope.profiles,
+                    workspace: target.workspace.as_ref(),
+                    member_name: target.member_name.as_deref(),
+                };
+                cmd_status(&target.root, json, selection)?
+            }
+        }
+        Commands::Cache { command } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_cache(&target.root, command)?
+        }
+        Commands::Env { command } => cmd_env(&root, command, &scope)?,
         Commands::Sync {
             no_prune,
             locked,
@@ -1345,18 +1929,23 @@ fn main() -> Result<()> {
             verbose_cache,
             groups,
             all_groups,
-        } => cmd_sync(
-            &root,
-            SyncCommandArgs {
-                prune: !no_prune,
-                locked: locked || frozen,
-                offline,
-                jobs,
-                verbose_cache,
-                groups,
-                all_groups,
-            },
-        )?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_sync(
+                &target.root,
+                SyncCommandArgs {
+                    prune: !no_prune,
+                    locked: locked || frozen,
+                    offline,
+                    jobs,
+                    verbose_cache,
+                    groups,
+                    all_groups,
+                },
+                &scope.profiles,
+                target.workspace.as_ref(),
+            )?
+        }
         Commands::Doctor { strict } => cmd_doctor(&root, strict, no_color)?,
         Commands::Run {
             dry_run,
@@ -1370,34 +1959,53 @@ fn main() -> Result<()> {
             server_jar,
             groups,
             all_groups,
-        } => cmd_run(
-            &root,
-            RunCommandArgs {
-                dry_run,
-                java,
-                memory,
-                jvm_args,
-                mode,
-                username,
-                instance,
-                launcher_jar,
-                server_jar,
-                groups,
-                all_groups,
-            },
-        )?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_run(
+                &target.root,
+                RunCommandArgs {
+                    dry_run,
+                    java,
+                    memory,
+                    jvm_args,
+                    mode,
+                    username,
+                    instance,
+                    launcher_jar,
+                    server_jar,
+                    groups,
+                    all_groups,
+                },
+                &scope.profiles,
+                target.workspace.as_ref(),
+            )?
+        }
         Commands::Export {
             format,
             output,
             groups,
             all_groups,
-        } => cmd_export(&root, format, output, groups, all_groups)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_export(
+                &target.root,
+                format,
+                output,
+                groups,
+                all_groups,
+                &scope.profiles,
+                target.workspace.as_ref(),
+            )?
+        }
         Commands::Import {
             input,
             format,
             side,
             force,
-        } => cmd_import(&root, input, format, side, force)?,
+        } => {
+            let target = resolve_project_target(&root, &scope)?;
+            cmd_import(&target.root, input, format, side, force)?
+        }
     }
 
     Ok(())
@@ -1587,6 +2195,176 @@ fn cmd_group_remove(root: &Path, name: &str, no_lock: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_profile(root: &Path, command: ProfileCommands, scope: &ScopeArgs) -> Result<()> {
+    let workspace = load_workspace_optional(root)?;
+    let use_workspace_scope = scope.workspace || (workspace.is_some() && scope.member.is_none());
+
+    if use_workspace_scope {
+        let path = workspace_path(root);
+        let mut workspace = workspace
+            .with_context(|| format!("workspace not found, expected {}", path.display()))?;
+        match command {
+            ProfileCommands::Ls => {
+                if workspace.profiles.0.is_empty() {
+                    println!("no workspace profiles defined");
+                    return Ok(());
+                }
+                for (name, profile) in &workspace.profiles.0 {
+                    println!("{name}\t{}\tworkspace", format_group_list(&profile.groups));
+                }
+            }
+            ProfileCommands::Add { name, groups } => {
+                let name = normalize_profile_name(&name)?;
+                let normalized = groups
+                    .iter()
+                    .map(|group| normalize_group_selector(group))
+                    .collect::<Result<Vec<_>>>()?;
+                workspace.profiles.0.insert(
+                    name.clone(),
+                    mineconda_core::GroupProfile { groups: normalized },
+                );
+                write_workspace(&path, &workspace)?;
+                println!("updated workspace profile `{name}` in {}", path.display());
+            }
+            ProfileCommands::Remove { name } => {
+                let name = normalize_profile_name(&name)?;
+                if workspace.profiles.0.remove(&name).is_none() {
+                    bail!("profile `{name}` not found");
+                }
+                write_workspace(&path, &workspace)?;
+                println!("removed workspace profile `{name}` from {}", path.display());
+            }
+        }
+        return Ok(());
+    }
+
+    let target = resolve_project_target(root, scope)?;
+    let path = manifest_path(&target.root);
+    let mut manifest = load_manifest(&target.root)?;
+    match command {
+        ProfileCommands::Ls => {
+            let mut merged: HashMap<String, (Vec<String>, &'static str)> = HashMap::new();
+            if let Some(workspace) = target.workspace.as_ref() {
+                for (name, profile) in &workspace.profiles.0 {
+                    merged.insert(name.clone(), (profile.groups.clone(), "workspace"));
+                }
+            }
+            for (name, profile) in &manifest.profiles.0 {
+                merged.insert(name.clone(), (profile.groups.clone(), "project"));
+            }
+            if merged.is_empty() {
+                println!("no profiles defined");
+                return Ok(());
+            }
+            let mut names = merged.into_iter().collect::<Vec<_>>();
+            names.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, (groups, origin)) in names {
+                println!("{name}\t{}\t{origin}", format_group_list(&groups));
+            }
+        }
+        ProfileCommands::Add { name, groups } => {
+            let name = normalize_profile_name(&name)?;
+            let normalized = groups
+                .iter()
+                .map(|group| normalize_group_selector(group))
+                .collect::<Result<Vec<_>>>()?;
+            manifest.profiles.0.insert(
+                name.clone(),
+                mineconda_core::GroupProfile { groups: normalized },
+            );
+            write_manifest(&path, &manifest)?;
+            println!("updated profile `{name}` in {}", path.display());
+        }
+        ProfileCommands::Remove { name } => {
+            let name = normalize_profile_name(&name)?;
+            if manifest.remove_profile(&name).is_none() {
+                bail!("profile `{name}` not found");
+            }
+            write_manifest(&path, &manifest)?;
+            println!("removed profile `{name}` from {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_workspace(root: &Path, command: WorkspaceCommands) -> Result<()> {
+    match command {
+        WorkspaceCommands::Init { name } => {
+            fs::create_dir_all(root)
+                .with_context(|| format!("failed to create workspace root {}", root.display()))?;
+            let path = workspace_path(root);
+            if path.exists() {
+                bail!("workspace already exists at {}", path.display());
+            }
+            if manifest_path(root).exists() {
+                bail!(
+                    "workspace root already contains {}; keep workspace config separate from project manifests",
+                    manifest_path(root).display()
+                );
+            }
+            let workspace = WorkspaceConfig::new(name);
+            write_workspace(&path, &workspace)?;
+            println!("initialized {}", path.display());
+        }
+        WorkspaceCommands::Ls => {
+            let workspace = load_workspace_required(root)?;
+            println!(
+                "workspace {}\tmembers={}",
+                workspace.workspace.name,
+                workspace.member_entries().len()
+            );
+            for member in workspace_members(root, &workspace)? {
+                println!(
+                    "{}\tmanifest={}\tlock={}",
+                    member.name,
+                    manifest_path(&member.root).exists(),
+                    lockfile_path(&member.root).exists()
+                );
+            }
+        }
+        WorkspaceCommands::Add { path: member_path } => {
+            let path = workspace_path(root);
+            let mut workspace = load_workspace_required(root)?;
+            let member = normalize_member_entry(&member_path)?;
+            if workspace
+                .member_entries()
+                .iter()
+                .any(|existing| existing == &member)
+            {
+                bail!("workspace member `{member}` already exists");
+            }
+            fs::create_dir_all(root.join(&member)).with_context(|| {
+                format!(
+                    "failed to create workspace member directory {}",
+                    root.join(&member).display()
+                )
+            })?;
+            workspace.members.push(member.clone());
+            workspace.members.sort();
+            workspace.members.dedup();
+            write_workspace(&path, &workspace)?;
+            println!("added workspace member `{member}` to {}", path.display());
+        }
+        WorkspaceCommands::Remove { path: member_path } => {
+            let path = workspace_path(root);
+            let mut workspace = load_workspace_required(root)?;
+            let target = workspace_member_target(root, &workspace, &member_path)?;
+            let before = workspace.member_entries().len();
+            workspace.members.retain(|member| member != &target.name);
+            if workspace.member_entries().len() == before {
+                bail!("workspace member `{}` not found", target.name);
+            }
+            write_workspace(&path, &workspace)?;
+            println!(
+                "removed workspace member `{}` from {}",
+                target.name,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModListStatus {
     Synced,
@@ -1619,14 +2397,30 @@ fn cmd_ls(
     root: &Path,
     show_status: bool,
     show_info: bool,
-    groups: Vec<String>,
-    all_groups: bool,
     no_color: bool,
+    json: bool,
+    selection: ProjectSelection<'_>,
 ) -> Result<()> {
     let manifest = load_manifest(root)?;
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups = selection.active_groups(&manifest)?;
     let selected_specs = selected_manifest_specs(&manifest, &active_groups);
     if selected_specs.is_empty() {
+        if json {
+            emit_json_report(
+                &LsJsonReport {
+                    command: "ls",
+                    groups: active_groups.iter().cloned().collect(),
+                    profiles: selection.normalized_profiles()?,
+                    workspace: selection.workspace_name(),
+                    member: selection.member_name.map(ToString::to_string),
+                    summary: LsJsonSummary { roots: 0 },
+                    items: Vec::new(),
+                    messages: vec!["selected groups have no mods".to_string()],
+                },
+                0,
+            )?;
+            return Ok(());
+        }
         println!("selected groups have no mods");
         return Ok(());
     }
@@ -1640,8 +2434,12 @@ fn cmd_ls(
     } else {
         None
     };
+    let normalized_profiles = selection.normalized_profiles()?;
+    let mut json_items = Vec::new();
 
-    println!("📦 mods: {}", selected_specs.len());
+    if !json {
+        println!("📦 mods: {}", selected_specs.len());
+    }
     for (index, (group, spec)) in selected_specs.iter().enumerate() {
         let single_group = BTreeSet::from([group.clone()]);
         let locked = lock.as_ref().and_then(|item| {
@@ -1666,6 +2464,21 @@ fn cmd_ls(
                 }
             }
         };
+
+        json_items.push(LsJsonItem {
+            group: group.clone(),
+            id: spec.id.clone(),
+            source: spec.source.as_str().to_string(),
+            requested_version: spec.version.clone(),
+            locked_version: locked.map(|pkg| pkg.version.clone()),
+            status: state.label().to_string(),
+            install_path: spec.install_path_or_default(),
+            side: spec.side.as_str().to_string(),
+        });
+
+        if json {
+            continue;
+        }
 
         let resolved = locked.map(|pkg| pkg.version.as_str()).unwrap_or("-");
         let mut line = format!(
@@ -1719,6 +2532,27 @@ fn cmd_ls(
             println!("    source-ref: -");
             println!("    download: -");
         }
+    }
+
+    if json {
+        emit_json_report(
+            &LsJsonReport {
+                command: "ls",
+                groups: active_groups.iter().cloned().collect(),
+                profiles: normalized_profiles,
+                workspace: selection.workspace_name(),
+                member: selection.member_name.map(ToString::to_string),
+                summary: LsJsonSummary {
+                    roots: json_items.len(),
+                },
+                items: json_items,
+                messages: vec![format!(
+                    "selected groups={}",
+                    format_active_groups(&active_groups)
+                )],
+            },
+            0,
+        )?;
     }
 
     Ok(())
@@ -2148,6 +2982,8 @@ fn install_search_selection(
             groups: groups.into_iter().collect(),
             all_groups: false,
         },
+        &[],
+        None,
     )?;
 
     println!(
@@ -2796,30 +3632,222 @@ impl<'a> LockGraph<'a> {
     }
 }
 
-fn cmd_tree(
+fn tree_json_node(package: &LockedPackage) -> TreeJsonNode {
+    TreeJsonNode {
+        key: locked_package_graph_key(package),
+        id: package.id.clone(),
+        source: package.source.as_str().to_string(),
+        version: package.version.clone(),
+        groups: normalized_package_groups(package),
+    }
+}
+
+fn why_json_step(package: &LockedPackage) -> WhyJsonStep {
+    WhyJsonStep {
+        key: locked_package_graph_key(package),
+        id: package.id.clone(),
+        source: package.source.as_str().to_string(),
+        version: package.version.clone(),
+    }
+}
+
+fn collect_forward_tree_json(
+    graph: &LockGraph<'_>,
+    key: &str,
+    path: &mut Vec<String>,
+    nodes: &mut HashMap<String, TreeJsonNode>,
+    edges: &mut HashMap<(String, String, String, Option<String>), TreeJsonEdge>,
+) {
+    if path.iter().any(|entry| entry == key) {
+        return;
+    }
+
+    let Some(package) = graph.package(key) else {
+        return;
+    };
+    nodes
+        .entry(key.to_string())
+        .or_insert_with(|| tree_json_node(package));
+
+    path.push(key.to_string());
+    for edge in graph.forward_edges.get(key).into_iter().flatten() {
+        let child_key = lock_graph_key(edge.source, &edge.id);
+        edges
+            .entry((
+                key.to_string(),
+                child_key.clone(),
+                edge.kind.as_str().to_string(),
+                edge.constraint.clone(),
+            ))
+            .or_insert_with(|| TreeJsonEdge {
+                from: key.to_string(),
+                to: child_key.clone(),
+                kind: edge.kind.as_str().to_string(),
+                constraint: edge.constraint.clone(),
+            });
+        collect_forward_tree_json(graph, &child_key, path, nodes, edges);
+    }
+    path.pop();
+}
+
+fn collect_reverse_tree_json(
+    graph: &LockGraph<'_>,
+    key: &str,
+    groups: &BTreeSet<String>,
+    path: &mut Vec<String>,
+    nodes: &mut HashMap<String, TreeJsonNode>,
+    edges: &mut HashMap<(String, String, String, Option<String>), TreeJsonEdge>,
+) {
+    if path.iter().any(|entry| entry == key) {
+        return;
+    }
+
+    let Some(package) = graph.package(key) else {
+        return;
+    };
+    nodes
+        .entry(key.to_string())
+        .or_insert_with(|| tree_json_node(package));
+
+    path.push(key.to_string());
+    for edge in graph.reverse_edges.get(key).into_iter().flatten() {
+        let Some(dependent) = graph.package(&edge.dependent_key) else {
+            continue;
+        };
+        if !package_in_groups(dependent, groups) {
+            continue;
+        }
+        edges
+            .entry((
+                key.to_string(),
+                edge.dependent_key.clone(),
+                edge.kind.as_str().to_string(),
+                edge.constraint.clone(),
+            ))
+            .or_insert_with(|| TreeJsonEdge {
+                from: key.to_string(),
+                to: edge.dependent_key.clone(),
+                kind: edge.kind.as_str().to_string(),
+                constraint: edge.constraint.clone(),
+            });
+        collect_reverse_tree_json(graph, &edge.dependent_key, groups, path, nodes, edges);
+    }
+    path.pop();
+}
+
+fn build_tree_json_report(
     root: &Path,
-    id: Option<String>,
-    invert: Option<String>,
-    all: bool,
-    source: Option<SourceArg>,
-    groups: Vec<String>,
-    all_groups: bool,
-) -> Result<()> {
+    args: &TreeCommandArgs,
+    selection: ProjectSelection<'_>,
+) -> Result<TreeJsonReport> {
     let manifest = load_manifest(root)?;
     let lock = load_lockfile_required(root)?;
     ensure_lock_dependency_graph(&lock)?;
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups = selection.active_groups(&manifest)?;
     ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
     let graph = LockGraph::from_lock(&lock);
-    let source_filter = source.map(SourceArg::to_core);
+    let source_filter = args.source.map(SourceArg::to_core);
+    let normalized_profiles = selection.normalized_profiles()?;
 
-    let output = if let Some(query) = invert.as_deref() {
+    let mut nodes = HashMap::new();
+    let mut edges = HashMap::new();
+    let mut path = Vec::new();
+    let (mode, direction, roots): (String, String, Vec<String>) =
+        if let Some(query) = args.invert.as_deref() {
+            let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
+            let key = locked_package_graph_key(target);
+            collect_reverse_tree_json(
+                &graph,
+                &key,
+                &active_groups,
+                &mut path,
+                &mut nodes,
+                &mut edges,
+            );
+            ("invert".to_string(), "reverse".to_string(), vec![key])
+        } else if args.all {
+            let packages = sorted_lock_packages(&lock, &active_groups);
+            let keys = packages
+                .iter()
+                .map(|package| locked_package_graph_key(package))
+                .collect::<Vec<_>>();
+            for key in &keys {
+                collect_forward_tree_json(&graph, key, &mut path, &mut nodes, &mut edges);
+            }
+            ("all".to_string(), "forward".to_string(), keys)
+        } else if let Some(query) = args.id.as_deref() {
+            let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
+            let key = locked_package_graph_key(target);
+            collect_forward_tree_json(&graph, &key, &mut path, &mut nodes, &mut edges);
+            ("target".to_string(), "forward".to_string(), vec![key])
+        } else {
+            let roots = resolve_manifest_root_packages(&manifest, &lock, &active_groups)?;
+            let keys = roots
+                .iter()
+                .map(|package| locked_package_graph_key(package))
+                .collect::<Vec<_>>();
+            for key in &keys {
+                collect_forward_tree_json(&graph, key, &mut path, &mut nodes, &mut edges);
+            }
+            ("roots".to_string(), "forward".to_string(), keys)
+        };
+
+    let mut node_values = nodes.into_values().collect::<Vec<_>>();
+    node_values.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut edge_values = edges.into_values().collect::<Vec<_>>();
+    edge_values.sort_by(|left, right| {
+        (
+            left.from.as_str(),
+            left.to.as_str(),
+            left.kind.as_str(),
+            left.constraint.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                right.from.as_str(),
+                right.to.as_str(),
+                right.kind.as_str(),
+                right.constraint.as_deref().unwrap_or(""),
+            ))
+    });
+
+    Ok(TreeJsonReport {
+        command: "tree",
+        groups: active_groups.iter().cloned().collect(),
+        profiles: normalized_profiles,
+        workspace: selection.workspace_name(),
+        member: selection.member_name.map(ToString::to_string),
+        mode,
+        direction,
+        roots,
+        nodes: node_values,
+        edges: edge_values,
+        messages: vec![format!(
+            "selected groups={}",
+            format_active_groups(&active_groups)
+        )],
+    })
+}
+
+fn cmd_tree(root: &Path, args: TreeCommandArgs, selection: ProjectSelection<'_>) -> Result<()> {
+    let manifest = load_manifest(root)?;
+    let lock = load_lockfile_required(root)?;
+    ensure_lock_dependency_graph(&lock)?;
+    let active_groups = selection.active_groups(&manifest)?;
+    ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
+    let graph = LockGraph::from_lock(&lock);
+    let source_filter = args.source.map(SourceArg::to_core);
+
+    if args.json {
+        return emit_json_report(&build_tree_json_report(root, &args, selection)?, 0);
+    }
+
+    let output = if let Some(query) = args.invert.as_deref() {
         let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
         render_reverse_dependency_tree(&graph, target, &active_groups)
-    } else if all {
+    } else if args.all {
         let packages = sorted_lock_packages(&lock, &active_groups);
         render_forward_dependency_forest(&graph, &packages)
-    } else if let Some(query) = id.as_deref() {
+    } else if let Some(query) = args.id.as_deref() {
         let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
         render_forward_dependency_forest(&graph, &[target])
     } else {
@@ -2831,31 +3859,33 @@ fn cmd_tree(
     Ok(())
 }
 
-fn cmd_why(
-    root: &Path,
-    id: &str,
-    source: Option<SourceArg>,
-    groups: Vec<String>,
-    all_groups: bool,
-) -> Result<()> {
+fn cmd_why(root: &Path, args: WhyCommandArgs, selection: ProjectSelection<'_>) -> Result<()> {
     let manifest = load_manifest(root)?;
     let lock = load_lockfile_required(root)?;
     ensure_lock_dependency_graph(&lock)?;
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups = selection.active_groups(&manifest)?;
     ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
     let graph = LockGraph::from_lock(&lock);
     let roots = resolve_manifest_root_packages(&manifest, &lock, &active_groups)?;
-    let target = resolve_locked_package(&lock, id, source.map(SourceArg::to_core), &active_groups)?;
+    let target = resolve_locked_package(
+        &lock,
+        &args.id,
+        args.source.map(SourceArg::to_core),
+        &active_groups,
+    )?;
+    if args.json {
+        return emit_json_report(&build_why_json_report(root, &args, selection)?, 0);
+    }
     let output = render_why_report(&graph, &roots, target)?;
     print!("{output}");
     Ok(())
 }
 
-fn render_why_report(
+fn compute_why_paths(
     graph: &LockGraph<'_>,
     roots: &[&LockedPackage],
     target: &LockedPackage,
-) -> Result<String> {
+) -> Result<(bool, Vec<Vec<String>>)> {
     let target_key = locked_package_graph_key(target);
     let root_keys: Vec<String> = roots
         .iter()
@@ -2863,11 +3893,7 @@ fn render_why_report(
         .collect();
 
     if root_keys.iter().any(|key| key == &target_key) {
-        return Ok(format!(
-            "{} is a direct dependency\n{}\n",
-            locked_package_display(target),
-            locked_package_display(target)
-        ));
+        return Ok((true, vec![vec![target_key]]));
     }
 
     let mut distance: HashMap<String, usize> = HashMap::new();
@@ -2917,6 +3943,77 @@ fn render_why_report(
     let mut paths = Vec::new();
     let mut current = vec![target_key.clone()];
     collect_why_paths(&predecessors, &root_keys, &mut current, &mut paths);
+    paths.sort();
+    paths.dedup();
+    Ok((false, paths))
+}
+
+fn build_why_json_report(
+    root: &Path,
+    args: &WhyCommandArgs,
+    selection: ProjectSelection<'_>,
+) -> Result<WhyJsonReport> {
+    let manifest = load_manifest(root)?;
+    let lock = load_lockfile_required(root)?;
+    ensure_lock_dependency_graph(&lock)?;
+    let active_groups = selection.active_groups(&manifest)?;
+    ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
+    let graph = LockGraph::from_lock(&lock);
+    let roots = resolve_manifest_root_packages(&manifest, &lock, &active_groups)?;
+    let target = resolve_locked_package(
+        &lock,
+        &args.id,
+        args.source.map(SourceArg::to_core),
+        &active_groups,
+    )?;
+    let (direct, paths) = compute_why_paths(&graph, &roots, target)?;
+    let target_step = why_json_step(target);
+    Ok(WhyJsonReport {
+        command: "why",
+        groups: active_groups.iter().cloned().collect(),
+        profiles: selection.normalized_profiles()?,
+        workspace: selection.workspace_name(),
+        member: selection.member_name.map(ToString::to_string),
+        target: WhyJsonTarget {
+            key: target_step.key.clone(),
+            id: target_step.id.clone(),
+            source: target_step.source.clone(),
+            version: target_step.version.clone(),
+        },
+        reason: if direct {
+            "direct".to_string()
+        } else {
+            "transitive".to_string()
+        },
+        direct,
+        paths: paths
+            .into_iter()
+            .map(|path| {
+                path.into_iter()
+                    .filter_map(|key| graph.package(&key).map(why_json_step))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        messages: vec![format!(
+            "selected groups={}",
+            format_active_groups(&active_groups)
+        )],
+    })
+}
+
+fn render_why_report(
+    graph: &LockGraph<'_>,
+    roots: &[&LockedPackage],
+    target: &LockedPackage,
+) -> Result<String> {
+    let (direct, paths) = compute_why_paths(graph, roots, target)?;
+    if direct {
+        return Ok(format!(
+            "{} is a direct dependency\n{}\n",
+            locked_package_display(target),
+            locked_package_display(target)
+        ));
+    }
     let mut rendered_paths: Vec<String> = paths
         .into_iter()
         .map(|path| {
@@ -3238,13 +4335,20 @@ fn locked_package_display(package: &LockedPackage) -> String {
     )
 }
 
-fn cmd_lock(root: &Path, upgrade: bool, groups: Vec<String>, all_groups: bool) -> Result<()> {
+fn cmd_lock(
+    root: &Path,
+    upgrade: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<()> {
     let manifest = load_manifest(root)?;
     write_lock_from_manifest(
         root,
         &manifest,
         upgrade,
-        activation_groups(&manifest, &groups, all_groups)?,
+        activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?,
     )
 }
 
@@ -3419,9 +4523,12 @@ fn build_lock_diff_json_report(
     upgrade: bool,
     groups: Vec<String>,
     all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
 ) -> Result<std::result::Result<LockDiffJsonReport, JsonErrorReport>> {
     let manifest = load_manifest(root)?;
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups =
+        activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?;
     let current = load_lockfile_optional(root)?;
     let groups = active_groups.iter().cloned().collect::<Vec<_>>();
 
@@ -3452,7 +4559,10 @@ fn build_lock_diff_json_report(
             groups: active_groups.clone(),
         },
     )?;
-    let entries = compute_lock_diff_entries(current.as_ref(), &output.lockfile);
+    let current_for_diff = current
+        .as_ref()
+        .map(|lock| filtered_lockfile(lock, &active_groups));
+    let entries = compute_lock_diff_entries(current_for_diff.as_ref(), &output.lockfile);
     Ok(Ok(LockDiffJsonReport {
         command: "lock-diff",
         groups,
@@ -3469,13 +4579,20 @@ fn build_lock_diff_json_report(
 fn cmd_lock_diff(
     root: &Path,
     upgrade: bool,
-    groups: Vec<String>,
-    all_groups: bool,
     json: bool,
+    selection: ProjectSelection<'_>,
 ) -> Result<()> {
-    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    let groups = selection.groups.to_vec();
+    let fallback_groups = selection.fallback_groups();
     if json {
-        match build_lock_diff_json_report(root, upgrade, groups, all_groups) {
+        match build_lock_diff_json_report(
+            root,
+            upgrade,
+            groups.clone(),
+            selection.all_groups,
+            selection.profiles,
+            selection.workspace,
+        ) {
             Ok(Ok(report)) => {
                 let exit_code = if report.entries.is_empty() { 0 } else { 2 };
                 emit_json_report(&report, exit_code)
@@ -3487,7 +4604,14 @@ fn cmd_lock_diff(
             ),
         }
     } else {
-        match build_lock_diff_json_report(root, upgrade, groups, all_groups)? {
+        match build_lock_diff_json_report(
+            root,
+            upgrade,
+            groups,
+            selection.all_groups,
+            selection.profiles,
+            selection.workspace,
+        )? {
             Ok(report) => emit_command_report(render_lock_diff_json_report(&report)),
             Err(error) => emit_command_report(render_json_error_report(&error)),
         }
@@ -3498,6 +4622,8 @@ fn build_status_json_report(
     root: &Path,
     groups: Vec<String>,
     all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
 ) -> Result<StatusJsonReport> {
     let manifest_path = manifest_path(root);
     let lock_path = lockfile_path(root);
@@ -3562,7 +4688,8 @@ fn build_status_json_report(
         });
     };
 
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups =
+        activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?;
     let groups = active_groups.iter().cloned().collect::<Vec<_>>();
     let selected_specs = selected_manifest_specs(&manifest, &active_groups);
     messages.push(format!(
@@ -3671,7 +4798,8 @@ fn build_status_json_report(
                 groups: active_groups.clone(),
             },
         )?;
-        let entries = compute_lock_diff_entries(Some(&lock), &output.lockfile);
+        let current_for_diff = filtered_lockfile(&lock, &active_groups);
+        let entries = compute_lock_diff_entries(Some(&current_for_diff), &output.lockfile);
         if entries.is_empty() {
             resolution = "up_to_date";
             messages.push(format!(
@@ -3752,10 +4880,17 @@ fn build_status_json_report(
     })
 }
 
-fn cmd_status(root: &Path, groups: Vec<String>, all_groups: bool, json: bool) -> Result<()> {
-    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+fn cmd_status(root: &Path, json: bool, selection: ProjectSelection<'_>) -> Result<()> {
+    let groups = selection.groups.to_vec();
+    let fallback_groups = selection.fallback_groups();
     if json {
-        match build_status_json_report(root, groups, all_groups) {
+        match build_status_json_report(
+            root,
+            groups.clone(),
+            selection.all_groups,
+            selection.profiles,
+            selection.workspace,
+        ) {
             Ok(report) => emit_json_report(&report, report.summary.exit_code),
             Err(err) => emit_json_report(
                 &json_error_report("status", fallback_groups, format!("{err:#}"), 1),
@@ -3764,9 +4899,259 @@ fn cmd_status(root: &Path, groups: Vec<String>, all_groups: bool, json: bool) ->
         }
     } else {
         emit_command_report(render_status_json_report(&build_status_json_report(
-            root, groups, all_groups,
+            root,
+            groups,
+            selection.all_groups,
+            selection.profiles,
+            selection.workspace,
         )?))
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceAggregateSummary {
+    members: usize,
+    changed: usize,
+    failed: usize,
+    exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceAggregateMemberJson {
+    member: String,
+    path: String,
+    exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkspaceAggregateJsonReport {
+    command: &'static str,
+    workspace: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    profiles: Vec<String>,
+    summary: WorkspaceAggregateSummary,
+    members: Vec<WorkspaceAggregateMemberJson>,
+}
+
+fn cmd_status_workspace(
+    root: &Path,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+    json: bool,
+) -> Result<()> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    let normalized_profiles = normalized_profile_names(profiles)?;
+    let mut changed = 0usize;
+    let mut failed = 0usize;
+    let mut json_members = Vec::new();
+    let mut lines = vec![format!("workspace status: {} members", members.len())];
+
+    for member in members {
+        match build_status_json_report(
+            &member.root,
+            groups.clone(),
+            all_groups,
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(report) => {
+                if report.summary.exit_code != 0 {
+                    changed += 1;
+                }
+                lines.push(format!("{}: {}", member.name, report.summary.state));
+                json_members.push(WorkspaceAggregateMemberJson {
+                    member: member.name.clone(),
+                    path: member.root.display().to_string(),
+                    exit_code: report.summary.exit_code,
+                    report: Some(serde_json::to_value(&report)?),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                lines.push(format!("{}: error: {err}", member.name));
+                json_members.push(WorkspaceAggregateMemberJson {
+                    member: member.name.clone(),
+                    path: member.root.display().to_string(),
+                    exit_code: 1,
+                    report: None,
+                    error: Some(format!("{err:#}")),
+                });
+            }
+        }
+    }
+
+    let exit_code = if failed > 0 {
+        1
+    } else if changed > 0 {
+        2
+    } else {
+        0
+    };
+    if json {
+        return emit_json_report(
+            &WorkspaceAggregateJsonReport {
+                command: "status",
+                workspace: workspace.workspace.name,
+                groups: fallback_groups,
+                profiles: normalized_profiles,
+                summary: WorkspaceAggregateSummary {
+                    members: json_members.len(),
+                    changed,
+                    failed,
+                    exit_code,
+                },
+                members: json_members,
+            },
+            exit_code,
+        );
+    }
+
+    emit_command_report(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code,
+    })
+}
+
+fn cmd_lock_diff_workspace(
+    root: &Path,
+    upgrade: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+    json: bool,
+) -> Result<()> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    let normalized_profiles = normalized_profile_names(profiles)?;
+    let mut changed = 0usize;
+    let mut failed = 0usize;
+    let mut json_members = Vec::new();
+    let mut lines = vec![format!("workspace lock diff: {} members", members.len())];
+
+    for member in members {
+        match build_lock_diff_json_report(
+            &member.root,
+            upgrade,
+            groups.clone(),
+            all_groups,
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(Ok(report)) => {
+                if !report.entries.is_empty() {
+                    changed += 1;
+                }
+                lines.push(format!("{}: {} changes", member.name, report.entries.len()));
+                for entry in &report.entries {
+                    lines.push(format!(
+                        "  [{}] {}",
+                        member.name,
+                        render_lock_diff_entry(&LockDiffEntry {
+                            kind: match entry.kind.as_str() {
+                                "add" => LockDiffKind::Add,
+                                "remove" => LockDiffKind::Remove,
+                                "upgrade" => LockDiffKind::Upgrade,
+                                "downgrade" => LockDiffKind::Downgrade,
+                                "change_version" => LockDiffKind::ChangeVersion,
+                                "change_artifact" => LockDiffKind::ChangeArtifact,
+                                "change_groups" => LockDiffKind::ChangeGroups,
+                                "change_dependencies" => LockDiffKind::ChangeDependencies,
+                                _ => LockDiffKind::ChangeVersion,
+                            },
+                            id: entry.id.clone(),
+                            source: match entry.source.as_str() {
+                                "modrinth" => ModSource::Modrinth,
+                                "curseforge" => ModSource::Curseforge,
+                                "url" => ModSource::Url,
+                                "local" => ModSource::Local,
+                                "s3" => ModSource::S3,
+                                _ => ModSource::Local,
+                            },
+                            current_version: entry.current_version.clone(),
+                            desired_version: entry.desired_version.clone(),
+                            current_groups: entry.current_groups.clone(),
+                            desired_groups: entry.desired_groups.clone(),
+                            current_dependencies: Vec::new(),
+                            desired_dependencies: Vec::new(),
+                            current_artifact: entry.current_artifact.clone(),
+                            desired_artifact: entry.desired_artifact.clone(),
+                        })
+                    ));
+                }
+                json_members.push(WorkspaceAggregateMemberJson {
+                    member: member.name.clone(),
+                    path: member.root.display().to_string(),
+                    exit_code: if report.entries.is_empty() { 0 } else { 2 },
+                    report: Some(serde_json::to_value(&report)?),
+                    error: None,
+                });
+            }
+            Ok(Err(error)) => {
+                failed += 1;
+                lines.push(format!("{}: {}", member.name, error.error));
+                json_members.push(WorkspaceAggregateMemberJson {
+                    member: member.name.clone(),
+                    path: member.root.display().to_string(),
+                    exit_code: error.exit_code,
+                    report: Some(serde_json::to_value(&error)?),
+                    error: Some(error.error),
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                lines.push(format!("{}: error: {err}", member.name));
+                json_members.push(WorkspaceAggregateMemberJson {
+                    member: member.name.clone(),
+                    path: member.root.display().to_string(),
+                    exit_code: 1,
+                    report: None,
+                    error: Some(format!("{err:#}")),
+                });
+            }
+        }
+    }
+
+    let exit_code = if failed > 0 {
+        1
+    } else if changed > 0 {
+        2
+    } else {
+        0
+    };
+    if json {
+        return emit_json_report(
+            &WorkspaceAggregateJsonReport {
+                command: "lock-diff",
+                workspace: workspace.workspace.name,
+                groups: fallback_groups,
+                profiles: normalized_profiles,
+                summary: WorkspaceAggregateSummary {
+                    members: json_members.len(),
+                    changed,
+                    failed,
+                    exit_code,
+                },
+                members: json_members,
+            },
+            exit_code,
+        );
+    }
+
+    emit_command_report(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code,
+    })
 }
 
 fn cmd_cache(root: &Path, command: CacheCommands) -> Result<()> {
@@ -4331,7 +5716,12 @@ fn java_command_exists(command: &str, root: &Path) -> bool {
     false
 }
 
-fn cmd_sync(root: &Path, args: SyncCommandArgs) -> Result<()> {
+fn cmd_sync(
+    root: &Path,
+    args: SyncCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<()> {
     let SyncCommandArgs {
         prune,
         locked,
@@ -4347,11 +5737,12 @@ fn cmd_sync(root: &Path, args: SyncCommandArgs) -> Result<()> {
     }
     let mut lock = load_lockfile_required(root)?;
     let active_groups = if let Some(manifest) = manifest.as_ref() {
-        let groups = activation_groups(manifest, &groups, all_groups)?;
+        let groups =
+            activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
         ensure_lock_covers_groups(manifest, &lock, &groups)?;
         groups
-    } else if !groups.is_empty() || all_groups {
-        bail!("group filters require a manifest");
+    } else if !groups.is_empty() || all_groups || !profiles.is_empty() {
+        bail!("group/profile filters require a manifest");
     } else {
         BTreeSet::new()
     };
@@ -4616,7 +6007,12 @@ fn expected_cache_paths(lock: Option<&Lockfile>, cache_root: &Path) -> HashSet<P
     out
 }
 
-fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
+fn cmd_run(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<()> {
     let RunCommandArgs {
         dry_run,
         java,
@@ -4641,7 +6037,8 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
         .as_ref()
         .map(|manifest| to_run_loader_hint(manifest.project.loader.kind));
     let package_paths = if let Some(manifest) = manifest.as_ref() {
-        let active_groups = activation_groups(manifest, &groups, all_groups)?;
+        let active_groups =
+            activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
         if manifest.groups.is_empty() && active_groups.len() == 1 {
             None
         } else {
@@ -4655,8 +6052,8 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
                     .collect(),
             )
         }
-    } else if !groups.is_empty() || all_groups {
-        bail!("group filters require a manifest");
+    } else if !groups.is_empty() || all_groups || !profiles.is_empty() {
+        bail!("group/profile filters require a manifest");
     } else {
         None
     };
@@ -4712,10 +6109,13 @@ fn cmd_export(
     output: PathBuf,
     groups: Vec<String>,
     all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
 ) -> Result<()> {
     let manifest = load_manifest(root)?;
     let lock = load_lockfile_required(root)?;
-    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let active_groups =
+        activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?;
     ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
     let mut manifest = filtered_manifest_for_export(&manifest, &active_groups);
     let mut lock = filtered_lockfile(&lock, &active_groups);
@@ -4937,18 +6337,43 @@ fn write_import_overrides(
     Ok(written)
 }
 
-fn cmd_env(root: &Path, command: EnvCommands) -> Result<()> {
+fn cmd_env(root: &Path, command: EnvCommands, scope: &ScopeArgs) -> Result<()> {
+    if matches!(command, EnvCommands::List)
+        && load_workspace_optional(root)?.is_some()
+        && scope.all_members
+    {
+        return cmd_env_list_workspace(root);
+    }
+
+    let target = resolve_project_target(root, scope)?;
     match command {
         EnvCommands::Install {
             java,
             provider,
             force,
             use_for_project,
-        } => cmd_env_install(root, java, provider, force, use_for_project),
-        EnvCommands::Use { java, provider } => cmd_env_use(root, java, provider),
-        EnvCommands::List => cmd_env_list(root),
-        EnvCommands::Which => cmd_env_which(root),
+        } => cmd_env_install(&target.root, java, provider, force, use_for_project),
+        EnvCommands::Use { java, provider } => cmd_env_use(&target.root, java, provider),
+        EnvCommands::List => cmd_env_list(&target.root),
+        EnvCommands::Which => cmd_env_which(&target.root),
     }
+}
+
+fn cmd_env_list_workspace(root: &Path) -> Result<()> {
+    let workspace = load_workspace_required(root)?;
+    for member in workspace_members(root, &workspace)? {
+        let runtime = load_manifest_optional(&member.root)?
+            .map(|manifest| {
+                format!(
+                    "{} ({})",
+                    manifest.runtime.java,
+                    manifest.runtime.provider.as_str()
+                )
+            })
+            .unwrap_or_else(|| "unconfigured".to_string());
+        println!("{}\t{}", member.name, runtime);
+    }
+    Ok(())
 }
 
 fn cmd_env_install(
@@ -5060,6 +6485,7 @@ fn validate_manifest_groups(manifest: &Manifest) -> Result<()> {
             bail!("manifest contains invalid group name `{group}`");
         }
     }
+    validate_manifest_profiles(manifest)?;
     Ok(())
 }
 
@@ -5239,19 +6665,22 @@ mod tests {
     use mineconda_core::{
         DEFAULT_GROUP_NAME, LoaderKind, LoaderSpec, LockMetadata, LockedDependency,
         LockedDependencyKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
-        ProjectSection, RuntimeProfile, ServerProfile, lockfile_path, manifest_path,
-        write_lockfile, write_manifest,
+        ProjectSection, RuntimeProfile, ServerProfile, WorkspaceConfig, lockfile_path,
+        manifest_path, workspace_path, write_lockfile, write_manifest, write_workspace,
     };
     use mineconda_resolver::{ResolveRequest, SearchResult, SearchSource, resolve_lockfile};
     use serde_json::Value;
 
     use super::{
-        Cli, DoctorLevel, LockDiffKind, build_lock_diff_json_report, build_status_json_report,
+        Cli, DoctorLevel, LockDiffKind, ProjectSelection, ScopeArgs, TreeCommandArgs,
+        WhyCommandArgs, activation_groups_with_profiles, build_lock_diff_json_report,
+        build_status_json_report, build_tree_json_report, build_why_json_report,
         collect_s3_doctor_findings, compute_lock_diff_entries, display_width,
         extract_curseforge_project_id, extract_modrinth_slug, lock_package_matches_request,
         render_forward_dependency_forest, render_lock_diff_entry, render_lock_diff_json_report,
         render_reverse_dependency_tree, render_status_json_report, render_why_report,
-        resolve_java_for_run, resolve_search_install_target, truncate_visual, wrap_visual,
+        resolve_java_for_run, resolve_project_target, resolve_search_install_target,
+        truncate_visual, wrap_visual,
     };
 
     #[test]
@@ -5378,6 +6807,7 @@ mod tests {
             },
             mods,
             groups: Default::default(),
+            profiles: Default::default(),
             sources: Default::default(),
             cache: Default::default(),
             server: ServerProfile::default(),
@@ -5458,11 +6888,122 @@ mods = [
     }
 
     #[test]
+    fn activation_groups_include_workspace_profile_groups() {
+        let manifest = test_manifest_with_client_group();
+        let workspace: WorkspaceConfig = toml::from_str(
+            r#"
+[workspace]
+name = "demo"
+
+members = ["packs/client"]
+
+[profiles.client-dev]
+groups = ["client"]
+"#,
+        )
+        .expect("workspace config");
+
+        let groups = activation_groups_with_profiles(
+            &manifest,
+            Some(&workspace),
+            &[],
+            false,
+            &["client-dev".to_string()],
+        )
+        .expect("profile groups");
+        assert_eq!(
+            groups,
+            BTreeSet::from([DEFAULT_GROUP_NAME.to_string(), "client".to_string()])
+        );
+    }
+
+    #[test]
+    fn project_profile_overrides_workspace_profile() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[groups.client]
+mods = []
+
+[groups.dev]
+mods = []
+
+[profiles.client-dev]
+groups = ["client"]
+"#,
+        )
+        .expect("manifest config");
+        let workspace: WorkspaceConfig = toml::from_str(
+            r#"
+[workspace]
+name = "demo"
+
+members = ["packs/client"]
+
+[profiles.client-dev]
+groups = ["client", "dev"]
+"#,
+        )
+        .expect("workspace config");
+
+        let groups = activation_groups_with_profiles(
+            &manifest,
+            Some(&workspace),
+            &[],
+            false,
+            &["client-dev".to_string()],
+        )
+        .expect("profile groups");
+        assert_eq!(
+            groups,
+            BTreeSet::from([DEFAULT_GROUP_NAME.to_string(), "client".to_string()])
+        );
+    }
+
+    #[test]
     fn edit_groups_target_only_requested_group() {
         let manifest = test_manifest_with_client_group();
         let groups =
             super::edit_groups(&manifest, &["client".to_string()], false).expect("edit groups");
         assert_eq!(groups, vec!["client".to_string()]);
+    }
+
+    #[test]
+    fn resolve_project_target_finds_workspace_member_by_basename() {
+        let project = TempProject::new("workspace-target");
+        let workspace = WorkspaceConfig {
+            workspace: mineconda_core::WorkspaceSection {
+                name: "demo".to_string(),
+                members: Vec::new(),
+            },
+            members: vec!["packs/client".to_string()],
+            profiles: Default::default(),
+            runtime: None,
+        };
+        write_workspace(&workspace_path(&project.path), &workspace).expect("write workspace");
+        fs::create_dir_all(project.path.join("packs/client")).expect("member dir");
+
+        let target = resolve_project_target(
+            &project.path,
+            &ScopeArgs {
+                workspace: false,
+                member: Some("client".to_string()),
+                all_members: false,
+                profiles: Vec::new(),
+            },
+        )
+        .expect("resolve target");
+
+        assert_eq!(target.root, project.path.join("packs/client"));
+        assert_eq!(target.member_name.as_deref(), Some("packs/client"));
+        assert!(target.workspace.is_some());
     }
 
     fn test_package(id: &str, version: &str, dependencies: Vec<LockedDependency>) -> LockedPackage {
@@ -5541,6 +7082,53 @@ mods = [
     }
 
     #[test]
+    fn cli_parses_workspace_profile_and_json_flags() {
+        let cli = Cli::try_parse_from([
+            "mineconda",
+            "--member",
+            "packs/client",
+            "--profile",
+            "client-dev",
+            "ls",
+            "--json",
+        ])
+        .expect("ls json parse");
+        assert_eq!(cli.member.as_deref(), Some("packs/client"));
+        assert_eq!(cli.profiles, vec!["client-dev".to_string()]);
+        assert!(matches!(
+            cli.command,
+            super::Commands::Ls { json: true, .. }
+        ));
+
+        let cli = Cli::try_parse_from(["mineconda", "workspace", "add", "packs/client"])
+            .expect("workspace add parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Workspace {
+                command: super::WorkspaceCommands::Add { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "mineconda",
+            "--workspace",
+            "profile",
+            "add",
+            "client-dev",
+            "--group",
+            "client",
+        ])
+        .expect("profile add parse");
+        assert!(cli.workspace);
+        assert!(matches!(
+            cli.command,
+            super::Commands::Profile {
+                command: super::ProfileCommands::Add { .. }
+            }
+        ));
+    }
+
+    #[test]
     fn lock_diff_entries_capture_upgrade_group_and_dependency_changes() {
         let mut current = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
         current.groups = vec![DEFAULT_GROUP_NAME.to_string()];
@@ -5609,9 +7197,10 @@ mods = [
         lock.metadata.dependency_graph = false;
         write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
 
-        let report = build_lock_diff_json_report(&project.path, false, Vec::new(), false)
-            .expect("report")
-            .expect_err("expected metadata error");
+        let report =
+            build_lock_diff_json_report(&project.path, false, Vec::new(), false, &[], None)
+                .expect("report")
+                .expect_err("expected metadata error");
         assert_eq!(report.command, "lock-diff");
         assert_eq!(report.exit_code, 2);
         assert!(report.error.contains("dependency graph data"));
@@ -5647,8 +7236,8 @@ mods = [
         )
         .expect("installed package");
 
-        let report =
-            build_status_json_report(&project.path, Vec::new(), false).expect("status report");
+        let report = build_status_json_report(&project.path, Vec::new(), false, &[], None)
+            .expect("status report");
         assert_eq!(report.summary.state, "clean");
         assert_eq!(report.summary.exit_code, 0);
         assert_eq!(report.checks.resolution, "up_to_date");
@@ -5664,6 +7253,69 @@ mods = [
     }
 
     #[test]
+    fn status_and_lock_diff_ignore_inactive_group_entries() {
+        let project = TempProject::new("status-inactive-groups");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("demo jar");
+        fs::write(project.path.join("vendor/iris.jar"), b"iris").expect("iris jar");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "demo"
+source = "local"
+version = "vendor/demo.jar"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "iris", source = "local", version = "vendor/iris.jar", side = "client" }
+]
+"#,
+        )
+        .expect("manifest");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string(), "client".to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+        fs::create_dir_all(project.path.join("mods")).expect("mods dir");
+        let default_package = output
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.id == "demo")
+            .expect("default package");
+        fs::write(
+            project.path.join(default_package.install_path_or_default()),
+            b"installed",
+        )
+        .expect("installed package");
+
+        let status = build_status_json_report(&project.path, Vec::new(), false, &[], None)
+            .expect("status report");
+        assert_eq!(status.summary.state, "clean");
+
+        let diff = build_lock_diff_json_report(&project.path, false, Vec::new(), false, &[], None)
+            .expect("lock diff report")
+            .expect("lock diff should succeed");
+        assert!(diff.entries.is_empty());
+    }
+
+    #[test]
     fn status_report_marks_missing_lock_as_drift() {
         let project = TempProject::new("status-missing-lock");
         let manifest = test_manifest(vec![ModSpec::new(
@@ -5674,8 +7326,8 @@ mods = [
         )]);
         write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
 
-        let report =
-            build_status_json_report(&project.path, Vec::new(), false).expect("status report");
+        let report = build_status_json_report(&project.path, Vec::new(), false, &[], None)
+            .expect("status report");
         assert_eq!(report.summary.state, "drift");
         assert_eq!(report.summary.exit_code, 2);
         assert!(!report.lockfile.exists);
@@ -5835,6 +7487,124 @@ mods = [
                 "`-- beta [modrinth] 1.1.0 (depended on via required)\n",
                 "    `-- alpha [modrinth] 1.0.0 (depended on via required)\n",
             )
+        );
+    }
+
+    #[test]
+    fn tree_json_report_contains_nodes_and_edges() {
+        let project = TempProject::new("tree-json");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "alpha"
+source = "modrinth"
+version = "1.0.0"
+side = "both"
+"#,
+        )
+        .expect("manifest");
+        let lock = test_lockfile(vec![
+            test_package("alpha", "1.0.0", vec![required_dependency("beta")]),
+            test_package("beta", "1.1.0", vec![required_dependency("gamma")]),
+            test_package("gamma", "1.2.0", Vec::new()),
+        ]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
+
+        let report = build_tree_json_report(
+            &project.path,
+            &TreeCommandArgs {
+                id: None,
+                invert: None,
+                all: false,
+                source: None,
+                json: true,
+            },
+            ProjectSelection {
+                groups: &[],
+                all_groups: false,
+                profiles: &[],
+                workspace: None,
+                member_name: None,
+            },
+        )
+        .expect("tree report");
+
+        assert_eq!(report.command, "tree");
+        assert_eq!(report.mode, "roots");
+        assert_eq!(report.direction, "forward");
+        assert_eq!(report.roots, vec!["alpha@modrinth".to_string()]);
+        assert_eq!(report.nodes.len(), 3);
+        assert!(report.edges.iter().any(|edge| {
+            edge.from == "alpha@modrinth" && edge.to == "beta@modrinth" && edge.kind == "required"
+        }));
+    }
+
+    #[test]
+    fn why_json_report_contains_transitive_path() {
+        let project = TempProject::new("why-json");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "alpha"
+source = "modrinth"
+version = "1.0.0"
+side = "both"
+"#,
+        )
+        .expect("manifest");
+        let lock = test_lockfile(vec![
+            test_package("alpha", "1.0.0", vec![required_dependency("beta")]),
+            test_package("beta", "1.1.0", vec![required_dependency("gamma")]),
+            test_package("gamma", "1.2.0", Vec::new()),
+        ]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
+
+        let report = build_why_json_report(
+            &project.path,
+            &WhyCommandArgs {
+                id: "beta".to_string(),
+                source: None,
+                json: true,
+            },
+            ProjectSelection {
+                groups: &[],
+                all_groups: false,
+                profiles: &[],
+                workspace: None,
+                member_name: None,
+            },
+        )
+        .expect("why report");
+
+        assert_eq!(report.command, "why");
+        assert_eq!(report.reason, "transitive");
+        assert!(!report.direct);
+        assert_eq!(report.target.id, "beta");
+        assert_eq!(report.paths.len(), 1);
+        assert_eq!(
+            report.paths[0]
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
         );
     }
 

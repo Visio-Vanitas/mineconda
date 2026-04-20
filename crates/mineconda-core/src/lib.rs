@@ -8,6 +8,7 @@ use thiserror::Error;
 
 pub const MANIFEST_FILE: &str = "mineconda.toml";
 pub const LOCK_FILE: &str = "mineconda.lock";
+pub const WORKSPACE_FILE: &str = "mineconda-workspace.toml";
 pub const LOCK_GENERATOR: &str = "mineconda/0.1.0";
 pub const REPOSITORY_URL: &str = "https://github.com/Visio-Vanitas/mineconda";
 pub const DEFAULT_GROUP_NAME: &str = "default";
@@ -26,6 +27,8 @@ pub struct Manifest {
     pub mods: Vec<ModSpec>,
     #[serde(default, skip_serializing_if = "DependencyGroups::is_empty")]
     pub groups: DependencyGroups,
+    #[serde(default, skip_serializing_if = "ProfileRegistry::is_empty")]
+    pub profiles: ProfileRegistry,
     #[serde(default, skip_serializing_if = "SourceRegistry::is_empty")]
     pub sources: SourceRegistry,
     #[serde(default, skip_serializing_if = "CacheRegistry::is_empty")]
@@ -54,6 +57,7 @@ impl Manifest {
             },
             mods: Vec::new(),
             groups: DependencyGroups::default(),
+            profiles: ProfileRegistry::default(),
             sources: SourceRegistry::default(),
             cache: CacheRegistry::default(),
             server: ServerProfile::default(),
@@ -98,6 +102,22 @@ impl Manifest {
     pub fn has_named_group(&self, group: &str) -> bool {
         !is_default_group_name(group) && self.groups.0.contains_key(group)
     }
+
+    pub fn profile_names(&self) -> Vec<String> {
+        self.profiles.0.keys().cloned().collect()
+    }
+
+    pub fn profile(&self, name: &str) -> Option<&GroupProfile> {
+        self.profiles.0.get(name)
+    }
+
+    pub fn ensure_profile_mut(&mut self, name: &str) -> &mut GroupProfile {
+        self.profiles.0.entry(name.to_string()).or_default()
+    }
+
+    pub fn remove_profile(&mut self, name: &str) -> Option<GroupProfile> {
+        self.profiles.0.remove(name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -116,6 +136,22 @@ impl DependencyGroups {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GroupProfile {
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct ProfileRegistry(pub BTreeMap<String, GroupProfile>);
+
+impl ProfileRegistry {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 pub fn is_default_group_name(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case(DEFAULT_GROUP_NAME)
 }
@@ -128,6 +164,55 @@ pub fn is_valid_group_name(name: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+pub fn is_valid_profile_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed == name
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub workspace: WorkspaceSection,
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "ProfileRegistry::is_empty")]
+    pub profiles: ProfileRegistry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeProfile>,
+}
+
+impl WorkspaceConfig {
+    pub fn new(name: String) -> Self {
+        Self {
+            workspace: WorkspaceSection {
+                name,
+                members: Vec::new(),
+            },
+            members: Vec::new(),
+            profiles: ProfileRegistry::default(),
+            runtime: None,
+        }
+    }
+
+    pub fn member_entries(&self) -> &[String] {
+        if self.members.is_empty() {
+            &self.workspace.members
+        } else {
+            &self.members
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSection {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,6 +707,10 @@ pub fn lockfile_path(root: &Path) -> PathBuf {
     root.join(LOCK_FILE)
 }
 
+pub fn workspace_path(root: &Path) -> PathBuf {
+    root.join(WORKSPACE_FILE)
+}
+
 pub fn read_manifest(path: &Path) -> Result<Manifest, CoreError> {
     let raw = fs::read_to_string(path)?;
     Ok(toml::from_str(&raw)?)
@@ -629,6 +718,17 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, CoreError> {
 
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), CoreError> {
     let raw = toml::to_string_pretty(manifest)?;
+    fs::write(path, raw)?;
+    Ok(())
+}
+
+pub fn read_workspace(path: &Path) -> Result<WorkspaceConfig, CoreError> {
+    let raw = fs::read_to_string(path)?;
+    Ok(toml::from_str(&raw)?)
+}
+
+pub fn write_workspace(path: &Path, workspace: &WorkspaceConfig) -> Result<(), CoreError> {
+    let raw = toml::to_string_pretty(workspace)?;
     fs::write(path, raw)?;
     Ok(())
 }
@@ -690,8 +790,8 @@ fn sanitize_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_GROUP_NAME, Lockfile, Manifest, REPOSITORY_URL, S3CacheAuth,
-        build_lockfile_from_manifest, http_user_agent,
+        DEFAULT_GROUP_NAME, Lockfile, Manifest, REPOSITORY_URL, S3CacheAuth, WorkspaceConfig,
+        build_lockfile_from_manifest, http_user_agent, is_valid_profile_name,
     };
 
     #[test]
@@ -829,6 +929,67 @@ mods = [
         assert_eq!(manifest.mods.len(), 1);
         assert!(manifest.has_named_group("client"));
         assert_eq!(manifest.group_mods("client").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn manifest_supports_named_profiles() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[profiles.client-dev]
+groups = ["client", "dev"]
+"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest
+                .profile("client-dev")
+                .map(|profile| profile.groups.clone()),
+            Some(vec!["client".to_string(), "dev".to_string()])
+        );
+    }
+
+    #[test]
+    fn workspace_config_supports_members_and_profiles() {
+        let workspace: WorkspaceConfig = toml::from_str(
+            r#"
+[workspace]
+name = "demo"
+
+members = ["packs/client", "packs/server"]
+
+[profiles.client-dev]
+groups = ["client", "dev"]
+"#,
+        )
+        .expect("workspace should parse");
+
+        assert_eq!(workspace.workspace.name, "demo");
+        assert_eq!(workspace.member_entries().len(), 2);
+        assert_eq!(
+            workspace
+                .profiles
+                .0
+                .get("client-dev")
+                .map(|profile| profile.groups.clone()),
+            Some(vec!["client".to_string(), "dev".to_string()])
+        );
+    }
+
+    #[test]
+    fn profile_names_use_lowercase_kebab_case() {
+        assert!(is_valid_profile_name("client-dev"));
+        assert!(!is_valid_profile_name("ClientDev"));
+        assert!(!is_valid_profile_name(" client"));
+        assert!(!is_valid_profile_name(""));
     }
 
     #[test]

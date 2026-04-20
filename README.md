@@ -69,13 +69,14 @@ mineconda run --mode client --dry-run
 ## CLI Overview
 
 ```text
-mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
+mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 ```
 
 Main commands:
 
 - `init` / `add` / `remove` / `ls`
 - `group` / `tree` / `why`
+- `profile` / `workspace`
 - `search` / `update` / `pin` / `lock` / `status`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
@@ -86,6 +87,7 @@ Useful package-state commands:
 - `mineconda lock diff` previews lockfile changes without writing them
 - `mineconda status` reports manifest/lock/sync drift for the selected groups
 - add `--json` to either command for machine-readable output and stable `0/2/1` exit codes
+- `mineconda ls --json`, `mineconda tree --json`, and `mineconda why <id> --json` expose structured package graph data for tooling
 
 ## Dependency Groups
 
@@ -156,6 +158,84 @@ Notes:
   command asks for it
 - `run --mode client|server|both` does not auto-select groups; group activation is always
   explicit
+
+## Profiles
+
+Profiles are named aliases for group selections. They make repeated commands less noisy, similar
+to reusable dependency surfaces in `uv` workflows.
+
+Example:
+
+```toml
+[profiles.client-dev]
+groups = ["client", "dev"]
+```
+
+Usage:
+
+```bash
+mineconda profile add client-dev --group client --group dev
+mineconda sync --profile client-dev
+mineconda run --profile client-dev --mode client
+mineconda tree --profile client-dev
+```
+
+Rules:
+
+- project profiles live in `mineconda.toml`
+- workspace profiles live in `mineconda-workspace.toml`
+- member-local profiles override workspace profiles with the same name
+- `--profile` and `--group` are merged; `default` remains active
+
+## Workspace
+
+`mineconda` can manage multiple pack members from one workspace root.
+
+Workspace file:
+
+```toml
+members = ["packs/client", "packs/server"]
+
+[workspace]
+name = "demo"
+
+[profiles.client-dev]
+groups = ["client", "dev"]
+```
+
+Typical workflow:
+
+```bash
+mineconda workspace init demo
+mineconda workspace add packs/client
+mineconda workspace add packs/server
+
+mineconda --member client init client-pack --minecraft 1.21.1 --loader neoforge
+mineconda --member client add jei
+mineconda --member client lock
+
+mineconda --all-members status
+mineconda --all-members lock diff --json
+```
+
+Current workspace boundary:
+
+- each member keeps its own `mineconda.toml` and `mineconda.lock`
+- `status` and `lock diff` support `--all-members` aggregation
+- mutating commands such as `add`, `remove`, `sync`, `run`, and `export` require `--member`
+
+## JSON Output
+
+Machine-readable output is available for:
+
+- `mineconda lock diff --json`
+- `mineconda status --json`
+- `mineconda ls --json`
+- `mineconda tree --json`
+- `mineconda why <id> --json`
+
+When `--all-members` is used from a workspace root, `status --json` and `lock diff --json`
+return per-member reports with aggregate exit codes.
 
 ## Search UX
 
