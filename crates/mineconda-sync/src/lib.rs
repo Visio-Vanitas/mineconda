@@ -1512,7 +1512,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mineconda_core::{LoaderKind, LoaderSpec, ModSide};
+    use mineconda_core::{DEFAULT_GROUP_NAME, LoaderKind, LoaderSpec, ModSide};
 
     fn sample_package() -> LockedPackage {
         LockedPackage {
@@ -1527,6 +1527,7 @@ mod tests {
             download_url: "https://example.com/ferrite-core.jar".to_string(),
             hashes: Vec::new(),
             source_ref: None,
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
             dependencies: Vec::new(),
         }
     }
@@ -1541,6 +1542,7 @@ mod tests {
                 version: "latest".to_string(),
             },
             dependency_graph: true,
+            group_metadata: true,
         }
     }
 

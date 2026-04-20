@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +10,7 @@ pub const MANIFEST_FILE: &str = "mineconda.toml";
 pub const LOCK_FILE: &str = "mineconda.lock";
 pub const LOCK_GENERATOR: &str = "mineconda/0.1.0";
 pub const REPOSITORY_URL: &str = "https://github.com/Visio-Vanitas/mineconda";
+pub const DEFAULT_GROUP_NAME: &str = "default";
 
 pub fn http_user_agent() -> String {
     format!(
@@ -22,6 +24,8 @@ pub struct Manifest {
     pub project: ProjectSection,
     #[serde(default)]
     pub mods: Vec<ModSpec>,
+    #[serde(default, skip_serializing_if = "DependencyGroups::is_empty")]
+    pub groups: DependencyGroups,
     #[serde(default, skip_serializing_if = "SourceRegistry::is_empty")]
     pub sources: SourceRegistry,
     #[serde(default, skip_serializing_if = "CacheRegistry::is_empty")]
@@ -49,12 +53,81 @@ impl Manifest {
                 },
             },
             mods: Vec::new(),
+            groups: DependencyGroups::default(),
             sources: SourceRegistry::default(),
             cache: CacheRegistry::default(),
             server: ServerProfile::default(),
             runtime: RuntimeProfile::default(),
         }
     }
+
+    pub fn group_names(&self) -> Vec<String> {
+        let mut names = vec![DEFAULT_GROUP_NAME.to_string()];
+        names.extend(self.groups.0.keys().cloned());
+        names
+    }
+
+    pub fn group_mods(&self, group: &str) -> Option<&[ModSpec]> {
+        if is_default_group_name(group) {
+            return Some(&self.mods);
+        }
+        self.groups.0.get(group).map(|group| group.mods.as_slice())
+    }
+
+    pub fn group_mods_mut(&mut self, group: &str) -> Option<&mut Vec<ModSpec>> {
+        if is_default_group_name(group) {
+            return Some(&mut self.mods);
+        }
+        self.groups.0.get_mut(group).map(|group| &mut group.mods)
+    }
+
+    pub fn ensure_group_mods_mut(&mut self, group: &str) -> &mut Vec<ModSpec> {
+        if is_default_group_name(group) {
+            return &mut self.mods;
+        }
+        &mut self.groups.0.entry(group.to_string()).or_default().mods
+    }
+
+    pub fn remove_named_group(&mut self, group: &str) -> Option<ModGroup> {
+        if is_default_group_name(group) {
+            return None;
+        }
+        self.groups.0.remove(group)
+    }
+
+    pub fn has_named_group(&self, group: &str) -> bool {
+        !is_default_group_name(group) && self.groups.0.contains_key(group)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModGroup {
+    #[serde(default)]
+    pub mods: Vec<ModSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct DependencyGroups(pub BTreeMap<String, ModGroup>);
+
+impl DependencyGroups {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+pub fn is_default_group_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(DEFAULT_GROUP_NAME)
+}
+
+pub fn is_valid_group_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed == name
+        && !is_default_group_name(trimmed)
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +417,7 @@ impl Lockfile {
                 minecraft: manifest.project.minecraft.clone(),
                 loader: manifest.project.loader.clone(),
                 dependency_graph: true,
+                group_metadata: true,
             },
             packages,
         }
@@ -365,6 +439,8 @@ pub struct LockMetadata {
     pub loader: LoaderSpec,
     #[serde(default)]
     pub dependency_graph: bool,
+    #[serde(default)]
+    pub group_metadata: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -413,6 +489,8 @@ pub struct LockedPackage {
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<LockedDependency>,
 }
 
@@ -430,6 +508,7 @@ impl LockedPackage {
             download_url: "pending".to_string(),
             hashes: Vec::new(),
             source_ref: None,
+            groups: Vec::new(),
             dependencies: Vec::new(),
         }
     }
@@ -570,11 +649,21 @@ pub fn write_lockfile(path: &Path, lockfile: &Lockfile) -> Result<(), CoreError>
 }
 
 pub fn build_lockfile_from_manifest(manifest: &Manifest) -> Lockfile {
-    let packages = manifest
+    let mut packages = manifest
         .mods
         .iter()
         .map(LockedPackage::placeholder)
-        .collect();
+        .collect::<Vec<_>>();
+    for package in &mut packages {
+        package.groups = vec![DEFAULT_GROUP_NAME.to_string()];
+    }
+    for (group, mods) in &manifest.groups.0 {
+        for spec in &mods.mods {
+            let mut package = LockedPackage::placeholder(spec);
+            package.groups = vec![group.clone()];
+            packages.push(package);
+        }
+    }
     Lockfile::from_packages(manifest, packages)
 }
 
@@ -600,7 +689,10 @@ fn sanitize_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lockfile, Manifest, REPOSITORY_URL, S3CacheAuth, http_user_agent};
+    use super::{
+        DEFAULT_GROUP_NAME, Lockfile, Manifest, REPOSITORY_URL, S3CacheAuth,
+        build_lockfile_from_manifest, http_user_agent,
+    };
 
     #[test]
     fn s3_cache_auth_defaults_to_auto() {
@@ -706,5 +798,72 @@ download_url = "vendor/demo.jar"
         .expect("lockfile should parse");
         assert!(!lock.metadata.dependency_graph);
         assert!(lock.packages[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn manifest_supports_named_dependency_groups() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "jei"
+source = "modrinth"
+version = "latest"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "iris", source = "modrinth", version = "latest", side = "client" }
+]
+"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(manifest.mods.len(), 1);
+        assert!(manifest.has_named_group("client"));
+        assert_eq!(manifest.group_mods("client").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_lockfile_from_manifest_preserves_group_membership() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "jei"
+source = "modrinth"
+version = "latest"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "iris", source = "modrinth", version = "latest", side = "client" }
+]
+"#,
+        )
+        .expect("manifest should parse");
+
+        let lock = build_lockfile_from_manifest(&manifest);
+        assert!(lock.metadata.group_metadata);
+        assert_eq!(lock.packages.len(), 2);
+        assert_eq!(
+            lock.packages[0].groups,
+            vec![DEFAULT_GROUP_NAME.to_string()]
+        );
+        assert_eq!(lock.packages[1].groups, vec!["client".to_string()]);
     }
 }

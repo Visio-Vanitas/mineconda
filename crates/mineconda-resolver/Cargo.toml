@@ -12,3 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 mineconda-core = { path = "../mineconda-core" }
+
+[dev-dependencies]
+toml.workspace = true

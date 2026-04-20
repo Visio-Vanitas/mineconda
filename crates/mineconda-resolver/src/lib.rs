@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -9,8 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mineconda_core::{
-    HashAlgorithm, LoaderKind, LockedDependency, LockedDependencyKind, LockedPackage, Lockfile,
-    Manifest, ModSide, ModSource, PackageHash, S3SourceConfig, http_user_agent,
+    DEFAULT_GROUP_NAME, HashAlgorithm, LoaderKind, LockedDependency, LockedDependencyKind,
+    LockedPackage, Lockfile, Manifest, ModSide, ModSource, PackageHash, S3SourceConfig,
+    http_user_agent,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -36,6 +37,7 @@ const HTTP_RETRY_ATTEMPTS: usize = 3;
 #[derive(Debug, Clone, Default)]
 pub struct ResolveRequest {
     pub upgrade: bool,
+    pub groups: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +60,7 @@ struct ResolutionRequirement {
     constraint: VersionConstraint,
     install_path: Option<String>,
     side: ModSide,
+    groups: BTreeSet<String>,
     requested_by: String,
 }
 
@@ -75,11 +78,12 @@ struct DependencyEdge {
     id: String,
     constraint: VersionConstraint,
     kind: DependencyKind,
+    groups: BTreeSet<String>,
     requested_by: String,
 }
 
-fn manifest_request_chain(source: ModSource, id: &str) -> String {
-    format!("manifest -> {id} [{}]", source.as_str())
+fn manifest_request_chain(group: &str, source: ModSource, id: &str) -> String {
+    format!("manifest[{group}] -> {id} [{}]", source.as_str())
 }
 
 fn extend_request_chain(chain: &str, source: ModSource, id: &str, version: &str) -> String {
@@ -100,6 +104,32 @@ fn locked_dependency_from_edge(edge: &DependencyEdge) -> LockedDependency {
             Some(edge.constraint.describe())
         },
     }
+}
+
+fn package_groups(groups: &BTreeSet<String>) -> Vec<String> {
+    let mut values: Vec<String> = groups.iter().cloned().collect();
+    values.sort_by(
+        |left, right| match (left == DEFAULT_GROUP_NAME, right == DEFAULT_GROUP_NAME) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => left.cmp(right),
+        },
+    );
+    values
+}
+
+fn root_group_set(group: &str) -> BTreeSet<String> {
+    BTreeSet::from([group.to_string()])
+}
+
+fn active_groups(request: &ResolveRequest) -> BTreeSet<String> {
+    if request.groups.is_empty() {
+        return BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]);
+    }
+
+    let mut groups = request.groups.clone();
+    groups.insert(DEFAULT_GROUP_NAME.to_string());
+    groups
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +304,7 @@ pub fn resolve_lockfile(
     current: Option<&Lockfile>,
     request: &ResolveRequest,
 ) -> Result<ResolveOutput> {
-    let packages = resolve_locked_packages(manifest)?;
+    let packages = resolve_locked_packages(manifest, request)?;
     let plan = diff_packages(&packages, current, request);
     let lockfile = Lockfile::from_packages(manifest, packages);
     Ok(ResolveOutput { lockfile, plan })
@@ -285,7 +315,7 @@ pub fn resolve(
     current: Option<&Lockfile>,
     request: &ResolveRequest,
 ) -> Result<ResolutionPlan> {
-    let packages = resolve_locked_packages(manifest)?;
+    let packages = resolve_locked_packages(manifest, request)?;
     Ok(diff_packages(&packages, current, request))
 }
 
@@ -507,7 +537,10 @@ fn version_stability_rank(value: &str) -> u8 {
     }
 }
 
-fn resolve_locked_packages(manifest: &Manifest) -> Result<Vec<LockedPackage>> {
+fn resolve_locked_packages(
+    manifest: &Manifest,
+    request: &ResolveRequest,
+) -> Result<Vec<LockedPackage>> {
     let client = build_http_client()?;
     let mut requirements: HashMap<String, ResolutionRequirement> = HashMap::new();
     let mut aliases: HashMap<String, String> = HashMap::new();
@@ -515,20 +548,27 @@ fn resolve_locked_packages(manifest: &Manifest) -> Result<Vec<LockedPackage>> {
     let mut resolved: HashMap<String, ResolvedEntry> = HashMap::new();
     let mut conflicts: Vec<String> = Vec::new();
 
-    for mod_spec in &manifest.mods {
-        let requirement = ResolutionRequirement {
-            source: mod_spec.source,
-            id: mod_spec.id.clone(),
-            constraint: VersionConstraint::from_raw(&mod_spec.version),
-            install_path: mod_spec.install_path.clone(),
-            side: mod_spec.side,
-            requested_by: manifest_request_chain(mod_spec.source, &mod_spec.id),
+    for group in active_groups(request) {
+        let Some(mods) = manifest.group_mods(&group) else {
+            continue;
         };
 
-        if let Err(conflict) =
-            insert_requirement(&mut requirements, &mut aliases, &mut queue, requirement)
-        {
-            conflicts.push(conflict);
+        for mod_spec in mods {
+            let requirement = ResolutionRequirement {
+                source: mod_spec.source,
+                id: mod_spec.id.clone(),
+                constraint: VersionConstraint::from_raw(&mod_spec.version),
+                install_path: mod_spec.install_path.clone(),
+                side: mod_spec.side,
+                groups: root_group_set(&group),
+                requested_by: manifest_request_chain(&group, mod_spec.source, &mod_spec.id),
+            };
+
+            if let Err(conflict) =
+                insert_requirement(&mut requirements, &mut aliases, &mut queue, requirement)
+            {
+                conflicts.push(conflict);
+            }
         }
     }
 
@@ -592,6 +632,7 @@ fn resolve_locked_packages(manifest: &Manifest) -> Result<Vec<LockedPackage>> {
                         constraint: dependency.constraint.clone(),
                         install_path: None,
                         side: requirement.side,
+                        groups: dependency.groups.clone(),
                         requested_by: dependency.requested_by.clone(),
                     };
 
@@ -707,6 +748,7 @@ fn merge_requirement(
                 existing.id, err, incoming.requested_by
             )
         })?;
+        let groups_changed = merge_requirement_groups(&mut existing.groups, &incoming.groups);
 
         existing.constraint = merged_constraint;
         existing.side = merged_side;
@@ -714,12 +756,18 @@ fn merge_requirement(
 
         Ok((
             key,
-            constraint_changed || side_changed || install_path_changed,
+            constraint_changed || side_changed || install_path_changed || groups_changed,
         ))
     } else {
         requirements.insert(key.clone(), incoming);
         Ok((key, true))
     }
+}
+
+fn merge_requirement_groups(current: &mut BTreeSet<String>, incoming: &BTreeSet<String>) -> bool {
+    let before = current.len();
+    current.extend(incoming.iter().cloned());
+    current.len() != before
 }
 
 fn merge_install_paths(
@@ -861,6 +909,7 @@ fn resolve_modrinth_requirement(
             "requested={};project={};version={};name={}",
             requirement.id, package_id, version.id, version.name
         )),
+        groups: package_groups(&requirement.groups),
         dependencies: Vec::new(),
     };
 
@@ -896,6 +945,7 @@ fn resolve_modrinth_requirement(
                     .map(|id| VersionConstraint::exact(id.clone()))
                     .unwrap_or_else(VersionConstraint::any),
                 kind: DependencyKind::Required,
+                groups: requirement.groups.clone(),
                 requested_by: request_chain.clone(),
             }),
             "incompatible" => dependencies.push(DependencyEdge {
@@ -903,6 +953,7 @@ fn resolve_modrinth_requirement(
                 id: project_id,
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Incompatible,
+                groups: requirement.groups.clone(),
                 requested_by: request_chain.clone(),
             }),
             _ => {}
@@ -1033,6 +1084,7 @@ fn resolve_curseforge_requirement(
         download_url,
         hashes: Vec::new(),
         source_ref: Some(format!("mod={};file={}", mod_id, selected.id)),
+        groups: package_groups(&requirement.groups),
         dependencies: Vec::new(),
     };
 
@@ -1060,6 +1112,7 @@ fn resolve_curseforge_requirement(
                 id: dependency.mod_id.to_string(),
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Required,
+                groups: requirement.groups.clone(),
                 requested_by: request_chain.clone(),
             }),
             5 => dependencies.push(DependencyEdge {
@@ -1067,6 +1120,7 @@ fn resolve_curseforge_requirement(
                 id: dependency.mod_id.to_string(),
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Incompatible,
+                groups: requirement.groups.clone(),
                 requested_by: request_chain.clone(),
             }),
             _ => {}
@@ -1147,6 +1201,7 @@ fn resolve_url_requirement(requirement: &ResolutionRequirement) -> Result<Resolv
             download_url: url.clone(),
             hashes: Vec::new(),
             source_ref: Some(url.clone()),
+            groups: package_groups(&requirement.groups),
             dependencies: Vec::new(),
         },
         resolved_version_id: Some(url.clone()),
@@ -1179,6 +1234,7 @@ fn resolve_local_requirement(requirement: &ResolutionRequirement) -> Result<Reso
             download_url: path.clone(),
             hashes: Vec::new(),
             source_ref: Some(path.clone()),
+            groups: package_groups(&requirement.groups),
             dependencies: Vec::new(),
         },
         resolved_version_id: Some(path.clone()),
@@ -1222,6 +1278,7 @@ fn resolve_s3_requirement(
             download_url,
             hashes: Vec::new(),
             source_ref: Some(format!("s3://{}/{}", config.bucket.trim(), key)),
+            groups: package_groups(&requirement.groups),
             dependencies: Vec::new(),
         },
         resolved_version_id: Some(key),
@@ -1551,7 +1608,9 @@ fn diff_packages(
                 if !request.upgrade
                     && existing.version == desired.version
                     && existing.download_url == desired.download_url
-                    && existing.file_name == desired.file_name =>
+                    && existing.file_name == desired.file_name
+                    && existing.groups == desired.groups
+                    && existing.dependencies == desired.dependencies =>
             {
                 plan.unchanged.push(package_display_key(desired));
             }
@@ -2761,6 +2820,7 @@ mod tests {
             constraint: VersionConstraint::exact("v1"),
             install_path: None,
             side: ModSide::Both,
+            groups: root_group_set(DEFAULT_GROUP_NAME),
             requested_by: "manifest".to_string(),
         };
         let second = ResolutionRequirement {
@@ -2769,6 +2829,7 @@ mod tests {
             constraint: VersionConstraint::exact("v2"),
             install_path: None,
             side: ModSide::Both,
+            groups: root_group_set(DEFAULT_GROUP_NAME),
             requested_by: "dep:foo".to_string(),
         };
 
@@ -2787,6 +2848,7 @@ mod tests {
             constraint: VersionConstraint::any(),
             install_path: None,
             side: ModSide::Client,
+            groups: root_group_set(DEFAULT_GROUP_NAME),
             requested_by: "manifest".to_string(),
         };
         let second = ResolutionRequirement {
@@ -2795,6 +2857,7 @@ mod tests {
             constraint: VersionConstraint::exact("abc123"),
             install_path: None,
             side: ModSide::Server,
+            groups: root_group_set(DEFAULT_GROUP_NAME),
             requested_by: "dep:sodium-extra".to_string(),
         };
 
@@ -2816,6 +2879,7 @@ mod tests {
             constraint: VersionConstraint::exact("OihdIimA"),
             install_path: None,
             side: ModSide::Both,
+            groups: root_group_set(DEFAULT_GROUP_NAME),
             requested_by: "manifest".to_string(),
         };
         let resolved = ResolvedEntry {
@@ -2831,6 +2895,7 @@ mod tests {
                 download_url: "https://example.com/sodium.jar".to_string(),
                 hashes: Vec::new(),
                 source_ref: None,
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             },
             resolved_version_id: Some("OihdIimA".to_string()),
@@ -3181,5 +3246,63 @@ mod tests {
         assert_eq!(label, "1.2.3 (release)  [2026-04-20]");
         let no_date = format_install_version_label("1.2.3".to_string(), Some("invalid"));
         assert_eq!(no_date, "1.2.3");
+    }
+
+    #[test]
+    fn resolve_lockfile_tracks_group_membership_for_selected_groups() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "shared"
+source = "local"
+version = "vendor/shared.jar"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "shared", source = "local", version = "vendor/shared.jar", side = "client" },
+  { id = "iris", source = "local", version = "vendor/iris.jar", side = "client" }
+]
+"#,
+        )
+        .expect("manifest should parse");
+
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from(["client".to_string()]),
+            },
+        )
+        .expect("resolve lockfile");
+
+        assert_eq!(output.lockfile.packages.len(), 2);
+        let shared = output
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.id == "shared")
+            .expect("shared package");
+        assert_eq!(
+            shared.groups,
+            vec![DEFAULT_GROUP_NAME.to_string(), "client".to_string()]
+        );
+
+        let iris = output
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.id == "iris")
+            .expect("iris package");
+        assert_eq!(iris.groups, vec!["client".to_string()]);
     }
 }

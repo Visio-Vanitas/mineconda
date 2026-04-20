@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mineconda_core::{
-    JavaProvider, LoaderKind, LockedDependencyKind, LockedPackage, Lockfile, Manifest, ModSide,
-    ModSource, ModSpec, RuntimeProfile, S3CacheAuth, S3CacheConfig, S3SourceConfig, ServerProfile,
-    lockfile_path, manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
+    DEFAULT_GROUP_NAME, JavaProvider, LoaderKind, LockedDependencyKind, LockedPackage, Lockfile,
+    Manifest, ModSide, ModSource, ModSpec, RuntimeProfile, S3CacheAuth, S3CacheConfig,
+    S3SourceConfig, ServerProfile, is_default_group_name, is_valid_group_name, lockfile_path,
+    manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
 };
 use mineconda_export::{
     ExportFormat, ExportRequest, ImportFormat as PackImportFormat, ImportRequest, ImportSide,
@@ -76,6 +77,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = SideArg::Both)]
         side: SideArg,
         #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
         no_lock: bool,
     },
     Remove {
@@ -83,13 +86,25 @@ enum Commands {
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
         #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        all_groups: bool,
+        #[arg(long)]
         no_lock: bool,
+    },
+    Group {
+        #[command(subcommand)]
+        command: GroupCommands,
     },
     Ls {
         #[arg(long)]
         status: bool,
         #[arg(long)]
         info: bool,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Search {
         query: String,
@@ -105,6 +120,8 @@ enum Commands {
         install_first: bool,
         #[arg(long)]
         install_version: Option<String>,
+        #[arg(long)]
+        group: Option<String>,
     },
     Tree {
         id: Option<String>,
@@ -114,11 +131,19 @@ enum Commands {
         all: bool,
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Why {
         id: String,
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     #[command(visible_alias = "upgrade")]
     Update {
@@ -127,6 +152,10 @@ enum Commands {
         source: Option<SourceArg>,
         #[arg(long)]
         to: Option<String>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
         #[arg(long)]
         no_lock: bool,
     },
@@ -136,12 +165,20 @@ enum Commands {
         source: Option<SourceArg>,
         #[arg(long)]
         version: Option<String>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
         #[arg(long)]
         no_lock: bool,
     },
     Lock {
         #[arg(long)]
         upgrade: bool,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Cache {
         #[command(subcommand)]
@@ -164,6 +201,10 @@ enum Commands {
         jobs: usize,
         #[arg(long)]
         verbose_cache: bool,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Doctor {
         #[arg(long)]
@@ -188,12 +229,20 @@ enum Commands {
         launcher_jar: Option<PathBuf>,
         #[arg(long)]
         server_jar: Option<PathBuf>,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Export {
         #[arg(long, value_enum, default_value_t = ExportArg::Mrpack)]
         format: ExportArg,
         #[arg(long, default_value = "dist/modpack")]
         output: PathBuf,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
     },
     Import {
         input: String,
@@ -224,6 +273,19 @@ enum EnvCommands {
     },
     List,
     Which,
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCommands {
+    Ls,
+    Add {
+        name: String,
+    },
+    Remove {
+        name: String,
+        #[arg(long)]
+        no_lock: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -453,6 +515,8 @@ struct RunCommandArgs {
     instance: String,
     launcher_jar: Option<PathBuf>,
     server_jar: Option<PathBuf>,
+    groups: Vec<String>,
+    all_groups: bool,
 }
 
 #[derive(Debug)]
@@ -465,6 +529,173 @@ struct SearchCommandArgs {
     non_interactive: bool,
     install_first: bool,
     install_version: Option<String>,
+    group: Option<String>,
+}
+
+#[derive(Debug)]
+struct SyncCommandArgs {
+    prune: bool,
+    locked: bool,
+    offline: bool,
+    jobs: usize,
+    verbose_cache: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+}
+
+fn normalize_group_selector(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("group name must not be empty");
+    }
+    if is_default_group_name(trimmed) {
+        return Ok(DEFAULT_GROUP_NAME.to_string());
+    }
+    if !is_valid_group_name(trimmed) {
+        bail!("invalid group name `{trimmed}` (expected lowercase kebab-case)");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_named_group(raw: &str) -> Result<String> {
+    let group = normalize_group_selector(raw)?;
+    if is_default_group_name(&group) {
+        bail!("`default` is the built-in root group and cannot be created or removed");
+    }
+    Ok(group)
+}
+
+fn target_group_name(group: Option<String>) -> Result<String> {
+    match group {
+        Some(group) => normalize_group_selector(&group),
+        None => Ok(DEFAULT_GROUP_NAME.to_string()),
+    }
+}
+
+fn activation_groups(
+    manifest: &Manifest,
+    requested: &[String],
+    all_groups: bool,
+) -> Result<BTreeSet<String>> {
+    let mut groups = BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]);
+
+    if all_groups {
+        groups.extend(
+            manifest
+                .group_names()
+                .into_iter()
+                .filter(|group| !is_default_group_name(group)),
+        );
+        return Ok(groups);
+    }
+
+    for raw in requested {
+        let group = normalize_group_selector(raw)?;
+        if is_default_group_name(&group) {
+            continue;
+        }
+        if !manifest.has_named_group(&group) {
+            bail!("group `{group}` not found in manifest");
+        }
+        groups.insert(group);
+    }
+
+    Ok(groups)
+}
+
+fn edit_groups(manifest: &Manifest, requested: &[String], all_groups: bool) -> Result<Vec<String>> {
+    if all_groups {
+        return Ok(manifest.group_names());
+    }
+
+    if requested.is_empty() {
+        return Ok(vec![DEFAULT_GROUP_NAME.to_string()]);
+    }
+
+    let mut groups = BTreeSet::new();
+    for raw in requested {
+        let group = normalize_group_selector(raw)?;
+        if !is_default_group_name(&group) && !manifest.has_named_group(&group) {
+            bail!("group `{group}` not found in manifest");
+        }
+        groups.insert(group);
+    }
+
+    Ok(groups.into_iter().collect())
+}
+
+fn package_in_groups(package: &LockedPackage, groups: &BTreeSet<String>) -> bool {
+    if package.groups.is_empty() {
+        return groups.contains(DEFAULT_GROUP_NAME);
+    }
+    package.groups.iter().any(|group| groups.contains(group))
+}
+
+fn selected_manifest_specs<'a>(
+    manifest: &'a Manifest,
+    groups: &BTreeSet<String>,
+) -> Vec<(String, &'a ModSpec)> {
+    let mut entries = Vec::new();
+    for group in groups {
+        if let Some(mods) = manifest.group_mods(group) {
+            entries.extend(mods.iter().map(|spec| (group.clone(), spec)));
+        }
+    }
+    entries
+}
+
+fn ensure_lock_group_metadata(
+    manifest: &Manifest,
+    lock: &Lockfile,
+    groups: &BTreeSet<String>,
+) -> Result<()> {
+    let needs_group_metadata = !manifest.groups.is_empty() || groups.len() > 1;
+    if needs_group_metadata && !lock.metadata.group_metadata {
+        bail!("lockfile does not contain dependency group data; rerun `mineconda lock` first");
+    }
+    Ok(())
+}
+
+fn ensure_lock_covers_groups(
+    manifest: &Manifest,
+    lock: &Lockfile,
+    groups: &BTreeSet<String>,
+) -> Result<()> {
+    ensure_lock_group_metadata(manifest, lock, groups)?;
+
+    for (group, spec) in selected_manifest_specs(manifest, groups) {
+        let matches = lock.packages.iter().any(|package| {
+            package_in_groups(package, &BTreeSet::from([group.clone()]))
+                && lock_package_matches_spec(package, spec)
+        });
+        if !matches {
+            bail!(
+                "lockfile does not contain group `{group}` entry `{}` [{}]; rerun `mineconda lock` with the required groups",
+                spec.id,
+                spec.source.as_str()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn filtered_lockfile(lock: &Lockfile, groups: &BTreeSet<String>) -> Lockfile {
+    let mut filtered = lock.clone();
+    filtered
+        .packages
+        .retain(|package| package_in_groups(package, groups));
+    filtered
+}
+
+fn filtered_manifest_for_export(manifest: &Manifest, groups: &BTreeSet<String>) -> Manifest {
+    let mut filtered = manifest.clone();
+    filtered.mods = selected_manifest_specs(manifest, groups)
+        .into_iter()
+        .map(|(_, spec)| spec.clone())
+        .collect();
+    filtered.groups = Default::default();
+    filtered
 }
 
 fn main() -> Result<()> {
@@ -486,14 +717,23 @@ fn main() -> Result<()> {
             source,
             version,
             side,
+            group,
             no_lock,
-        } => cmd_add(&root, id, source, version, side, no_lock)?,
+        } => cmd_add(&root, id, source, version, side, group, no_lock)?,
         Commands::Remove {
             id,
             source,
+            group,
+            all_groups,
             no_lock,
-        } => cmd_remove(&root, &id, source, no_lock)?,
-        Commands::Ls { status, info } => cmd_ls(&root, status, info, no_color)?,
+        } => cmd_remove(&root, &id, source, group, all_groups, no_lock)?,
+        Commands::Group { command } => cmd_group(&root, command)?,
+        Commands::Ls {
+            status,
+            info,
+            groups,
+            all_groups,
+        } => cmd_ls(&root, status, info, groups, all_groups, no_color)?,
         Commands::Search {
             query,
             source,
@@ -502,6 +742,7 @@ fn main() -> Result<()> {
             non_interactive,
             install_first,
             install_version,
+            group,
         } => cmd_search(
             &root,
             SearchCommandArgs {
@@ -513,6 +754,7 @@ fn main() -> Result<()> {
                 non_interactive,
                 install_first,
                 install_version,
+                group,
             },
         )?,
         Commands::Tree {
@@ -520,21 +762,36 @@ fn main() -> Result<()> {
             invert,
             all,
             source,
-        } => cmd_tree(&root, id, invert, all, source)?,
-        Commands::Why { id, source } => cmd_why(&root, &id, source)?,
+            groups,
+            all_groups,
+        } => cmd_tree(&root, id, invert, all, source, groups, all_groups)?,
+        Commands::Why {
+            id,
+            source,
+            groups,
+            all_groups,
+        } => cmd_why(&root, &id, source, groups, all_groups)?,
         Commands::Update {
             id,
             source,
             to,
+            groups,
+            all_groups,
             no_lock,
-        } => cmd_update(&root, id, source, to, no_lock)?,
+        } => cmd_update(&root, id, source, to, groups, all_groups, no_lock)?,
         Commands::Pin {
             id,
             source,
             version,
+            groups,
+            all_groups,
             no_lock,
-        } => cmd_pin(&root, id, source, version, no_lock)?,
-        Commands::Lock { upgrade } => cmd_lock(&root, upgrade)?,
+        } => cmd_pin(&root, id, source, version, groups, all_groups, no_lock)?,
+        Commands::Lock {
+            upgrade,
+            groups,
+            all_groups,
+        } => cmd_lock(&root, upgrade, groups, all_groups)?,
         Commands::Cache { command } => cmd_cache(&root, command)?,
         Commands::Env { command } => cmd_env(&root, command)?,
         Commands::Sync {
@@ -544,13 +801,19 @@ fn main() -> Result<()> {
             offline,
             jobs,
             verbose_cache,
+            groups,
+            all_groups,
         } => cmd_sync(
             &root,
-            !no_prune,
-            locked || frozen,
-            offline,
-            jobs,
-            verbose_cache,
+            SyncCommandArgs {
+                prune: !no_prune,
+                locked: locked || frozen,
+                offline,
+                jobs,
+                verbose_cache,
+                groups,
+                all_groups,
+            },
         )?,
         Commands::Doctor { strict } => cmd_doctor(&root, strict, no_color)?,
         Commands::Run {
@@ -563,6 +826,8 @@ fn main() -> Result<()> {
             instance,
             launcher_jar,
             server_jar,
+            groups,
+            all_groups,
         } => cmd_run(
             &root,
             RunCommandArgs {
@@ -575,9 +840,16 @@ fn main() -> Result<()> {
                 instance,
                 launcher_jar,
                 server_jar,
+                groups,
+                all_groups,
             },
         )?,
-        Commands::Export { format, output } => cmd_export(&root, format, output)?,
+        Commands::Export {
+            format,
+            output,
+            groups,
+            all_groups,
+        } => cmd_export(&root, format, output, groups, all_groups)?,
         Commands::Import {
             input,
             format,
@@ -620,10 +892,12 @@ fn cmd_add(
     source: SourceArg,
     version: String,
     side: SideArg,
+    group: Option<String>,
     no_lock: bool,
 ) -> Result<()> {
     let path = manifest_path(root);
     let mut manifest = load_manifest(root)?;
+    let group = target_group_name(group)?;
 
     let source = source.to_core();
     if source == ModSource::S3
@@ -642,47 +916,131 @@ fn cmd_add(
         );
     }
     let side = side.to_core();
-    if let Some(existing) = manifest
-        .mods
+    let group_mods = manifest.ensure_group_mods_mut(&group);
+    if let Some(existing) = group_mods
         .iter_mut()
         .find(|entry| entry.id == id && entry.source == source)
     {
         existing.version = version.clone();
         existing.side = side;
-        println!("updated mod {} in {}", id, path.display());
+        println!("updated mod {} in {} [{}]", id, path.display(), group);
     } else {
-        manifest
-            .mods
-            .push(ModSpec::new(id.clone(), source, version, side));
-        println!("added mod {} to {}", id, path.display());
+        group_mods.push(ModSpec::new(id.clone(), source, version, side));
+        println!("added mod {} to {} [{}]", id, path.display(), group);
     }
 
     write_manifest(&path, &manifest)?;
     if !no_lock {
-        write_lock_from_manifest(root, &manifest, false)?;
+        let groups = if is_default_group_name(&group) {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([group.clone()])
+        };
+        write_lock_from_manifest(root, &manifest, false, groups)?;
     }
     Ok(())
 }
 
-fn cmd_remove(root: &Path, id: &str, source: Option<SourceArg>, no_lock: bool) -> Result<()> {
+fn cmd_remove(
+    root: &Path,
+    id: &str,
+    source: Option<SourceArg>,
+    group: Option<String>,
+    all_groups: bool,
+    no_lock: bool,
+) -> Result<()> {
     let path = manifest_path(root);
     let mut manifest = load_manifest(root)?;
     let source_filter = source.map(SourceArg::to_core);
-    let before = manifest.mods.len();
-    manifest.mods.retain(|item| {
-        if item.id != id {
-            return true;
-        }
-        match source_filter {
-            Some(source) => item.source != source,
-            None => false,
-        }
-    });
+    let target_groups = if all_groups {
+        manifest.group_names()
+    } else {
+        vec![target_group_name(group)?]
+    };
+    let mut removed = 0usize;
+
+    for group in &target_groups {
+        let Some(mods) = manifest.group_mods_mut(group) else {
+            continue;
+        };
+        let before = mods.len();
+        mods.retain(|item| {
+            if item.id != id {
+                return true;
+            }
+            match source_filter {
+                Some(source) => item.source != source,
+                None => false,
+            }
+        });
+        removed += before.saturating_sub(mods.len());
+    }
     write_manifest(&path, &manifest)?;
-    let removed = before.saturating_sub(manifest.mods.len());
     println!("removed {removed} matching entries");
     if !no_lock {
-        write_lock_from_manifest(root, &manifest, false)?;
+        let groups = if all_groups {
+            activation_groups(&manifest, &[], true)?
+        } else {
+            let selected = target_group_name(target_groups.first().cloned())?;
+            if is_default_group_name(&selected) || !manifest.has_named_group(&selected) {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([selected])
+            }
+        };
+        write_lock_from_manifest(root, &manifest, false, groups)?;
+    }
+    Ok(())
+}
+
+fn cmd_group(root: &Path, command: GroupCommands) -> Result<()> {
+    match command {
+        GroupCommands::Ls => cmd_group_ls(root),
+        GroupCommands::Add { name } => cmd_group_add(root, &name),
+        GroupCommands::Remove { name, no_lock } => cmd_group_remove(root, &name, no_lock),
+    }
+}
+
+fn cmd_group_ls(root: &Path) -> Result<()> {
+    let manifest = load_manifest(root)?;
+    for group in manifest.group_names() {
+        let count = manifest
+            .group_mods(&group)
+            .map(|mods| mods.len())
+            .unwrap_or(0);
+        println!("{group}\t{count}");
+    }
+    Ok(())
+}
+
+fn cmd_group_add(root: &Path, name: &str) -> Result<()> {
+    let path = manifest_path(root);
+    let mut manifest = load_manifest(root)?;
+    let group = normalize_named_group(name)?;
+    if manifest.has_named_group(&group) {
+        bail!("group `{group}` already exists");
+    }
+    manifest.ensure_group_mods_mut(&group);
+    write_manifest(&path, &manifest)?;
+    println!("added group `{group}` to {}", path.display());
+    Ok(())
+}
+
+fn cmd_group_remove(root: &Path, name: &str, no_lock: bool) -> Result<()> {
+    let path = manifest_path(root);
+    let mut manifest = load_manifest(root)?;
+    let group = normalize_named_group(name)?;
+    let Some(removed) = manifest.remove_named_group(&group) else {
+        bail!("group `{group}` not found");
+    };
+    write_manifest(&path, &manifest)?;
+    println!(
+        "removed group `{group}` (mods={}) from {}",
+        removed.mods.len(),
+        path.display()
+    );
+    if !no_lock {
+        write_lock_from_manifest(root, &manifest, false, BTreeSet::new())?;
     }
     Ok(())
 }
@@ -715,10 +1073,19 @@ impl ModListStatus {
     }
 }
 
-fn cmd_ls(root: &Path, show_status: bool, show_info: bool, no_color: bool) -> Result<()> {
+fn cmd_ls(
+    root: &Path,
+    show_status: bool,
+    show_info: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    no_color: bool,
+) -> Result<()> {
     let manifest = load_manifest(root)?;
-    if manifest.mods.is_empty() {
-        println!("manifest has no mods");
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let selected_specs = selected_manifest_specs(&manifest, &active_groups);
+    if selected_specs.is_empty() {
+        println!("selected groups have no mods");
         return Ok(());
     }
 
@@ -732,12 +1099,13 @@ fn cmd_ls(root: &Path, show_status: bool, show_info: bool, no_color: bool) -> Re
         None
     };
 
-    println!("📦 mods: {}", manifest.mods.len());
-    for (index, spec) in manifest.mods.iter().enumerate() {
+    println!("📦 mods: {}", selected_specs.len());
+    for (index, (group, spec)) in selected_specs.iter().enumerate() {
+        let single_group = BTreeSet::from([group.clone()]);
         let locked = lock.as_ref().and_then(|item| {
-            item.packages
-                .iter()
-                .find(|pkg| lock_package_matches_spec(pkg, spec))
+            item.packages.iter().find(|pkg| {
+                package_in_groups(pkg, &single_group) && lock_package_matches_spec(pkg, spec)
+            })
         });
 
         let state = match locked {
@@ -759,10 +1127,11 @@ fn cmd_ls(root: &Path, show_status: bool, show_info: bool, no_color: bool) -> Re
 
         let resolved = locked.map(|pkg| pkg.version.as_str()).unwrap_or("-");
         let mut line = format!(
-            "{:>2}. {} [{}] req={} side={}",
+            "{:>2}. {} [{}] group={} req={} side={}",
             index + 1,
             spec.id,
             spec.source.as_str(),
+            group,
             spec.version,
             spec.side.as_str()
         );
@@ -818,6 +1187,8 @@ fn cmd_update(
     id: Option<String>,
     source: Option<SourceArg>,
     to: Option<String>,
+    groups: Vec<String>,
+    all_groups: bool,
     no_lock: bool,
 ) -> Result<()> {
     let mut manifest = load_manifest(root)?;
@@ -826,19 +1197,25 @@ fn cmd_update(
     if let Some(id) = id {
         let source_filter = source.map(SourceArg::to_core);
         let target = to.unwrap_or_else(|| "latest".to_string());
+        let target_groups = edit_groups(&manifest, &groups, all_groups)?;
         let mut changed = 0usize;
 
-        for spec in &mut manifest.mods {
-            if spec.id != id {
+        for group in &target_groups {
+            let Some(mods) = manifest.group_mods_mut(group) else {
                 continue;
+            };
+            for spec in mods {
+                if spec.id != id {
+                    continue;
+                }
+                if let Some(source) = source_filter
+                    && spec.source != source
+                {
+                    continue;
+                }
+                spec.version = target.clone();
+                changed += 1;
             }
-            if let Some(source) = source_filter
-                && spec.source != source
-            {
-                continue;
-            }
-            spec.version = target.clone();
-            changed += 1;
         }
 
         if changed == 0 {
@@ -848,12 +1225,19 @@ fn cmd_update(
         write_manifest(&path, &manifest)?;
         println!("updated {changed} entries of `{id}` to constraint `{target}`");
         if !no_lock {
-            write_lock_from_manifest(root, &manifest, true)?;
+            write_lock_from_manifest(
+                root,
+                &manifest,
+                true,
+                activation_groups(&manifest, &target_groups, false)?,
+            )?;
         }
         return Ok(());
     }
 
-    if source.is_some() || to.is_some() {
+    if (source.is_some() || to.is_some() || !groups.is_empty() || all_groups)
+        && (source.is_some() || to.is_some())
+    {
         bail!("`--source` and `--to` require an <id>");
     }
 
@@ -862,7 +1246,12 @@ fn cmd_update(
         return Ok(());
     }
 
-    write_lock_from_manifest(root, &manifest, true)?;
+    write_lock_from_manifest(
+        root,
+        &manifest,
+        true,
+        activation_groups(&manifest, &groups, all_groups)?,
+    )?;
     Ok(())
 }
 
@@ -871,6 +1260,8 @@ fn cmd_pin(
     id: String,
     source: Option<SourceArg>,
     version: Option<String>,
+    groups: Vec<String>,
+    all_groups: bool,
     no_lock: bool,
 ) -> Result<()> {
     let mut manifest = load_manifest(root)?;
@@ -893,18 +1284,24 @@ fn cmd_pin(
         first.version.clone()
     };
 
+    let target_groups = edit_groups(&manifest, &groups, all_groups)?;
     let mut changed = 0usize;
-    for spec in &mut manifest.mods {
-        if spec.id != id {
+    for group in &target_groups {
+        let Some(mods) = manifest.group_mods_mut(group) else {
             continue;
+        };
+        for spec in mods {
+            if spec.id != id {
+                continue;
+            }
+            if let Some(source) = source_filter
+                && spec.source != source
+            {
+                continue;
+            }
+            spec.version = pin_version.clone();
+            changed += 1;
         }
-        if let Some(source) = source_filter
-            && spec.source != source
-        {
-            continue;
-        }
-        spec.version = pin_version.clone();
-        changed += 1;
     }
 
     if changed == 0 {
@@ -914,7 +1311,12 @@ fn cmd_pin(
     write_manifest(&path, &manifest)?;
     println!("pinned {changed} entries of `{id}` to `{pin_version}`");
     if !no_lock {
-        write_lock_from_manifest(root, &manifest, false)?;
+        write_lock_from_manifest(
+            root,
+            &manifest,
+            false,
+            activation_groups(&manifest, &target_groups, false)?,
+        )?;
     }
     Ok(())
 }
@@ -971,6 +1373,7 @@ fn cmd_search(root: &Path, args: SearchCommandArgs) -> Result<()> {
         non_interactive,
         install_first,
         install_version,
+        group,
     } = args;
     let interactive = !non_interactive
         && std::io::stdin().is_terminal()
@@ -1061,6 +1464,7 @@ fn cmd_search(root: &Path, args: SearchCommandArgs) -> Result<()> {
             install_version.as_deref(),
             manifest_env.as_ref().map(|(value, _)| value.as_str()),
             manifest_env.as_ref().map(|(_, value)| *value),
+            group.as_deref(),
         )?;
         return Ok(());
     }
@@ -1098,6 +1502,7 @@ fn cmd_search(root: &Path, args: SearchCommandArgs) -> Result<()> {
                 version.as_deref(),
                 manifest_env.as_ref().map(|(value, _)| value.as_str()),
                 manifest_env.as_ref().map(|(_, value)| *value),
+                group.as_deref(),
             )?;
         }
         return Ok(());
@@ -1153,22 +1558,27 @@ fn install_search_selection(
     version: Option<&str>,
     minecraft_version: Option<&str>,
     loader: Option<LoaderKind>,
+    group: Option<&str>,
 ) -> Result<()> {
     let (id, source) = resolve_search_install_target(item)?;
     let mut manifest = load_manifest(root)?;
+    let group = match group {
+        Some(group) => normalize_group_selector(group)?,
+        None => DEFAULT_GROUP_NAME.to_string(),
+    };
     let side = item.supported_side.unwrap_or(ModSide::Both);
     let target_version =
         resolve_install_version_for_search(&id, source, version, minecraft_version, loader)?;
 
     if let Some(existing) = manifest
-        .mods
+        .ensure_group_mods_mut(&group)
         .iter_mut()
         .find(|entry| entry.id == id && entry.source == source)
     {
         existing.version = target_version.to_string();
         existing.side = side;
     } else {
-        manifest.mods.push(ModSpec::new(
+        manifest.ensure_group_mods_mut(&group).push(ModSpec::new(
             id.clone(),
             source,
             target_version.to_string(),
@@ -1179,8 +1589,24 @@ fn install_search_selection(
     let path = manifest_path(root);
     write_manifest(&path, &manifest)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    write_lock_from_manifest(root, &manifest, false)?;
-    cmd_sync(root, true, false, false, default_sync_jobs(), false)?;
+    let groups = if is_default_group_name(&group) {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([group.clone()])
+    };
+    write_lock_from_manifest(root, &manifest, false, groups.clone())?;
+    cmd_sync(
+        root,
+        SyncCommandArgs {
+            prune: true,
+            locked: false,
+            offline: false,
+            jobs: default_sync_jobs(),
+            verbose_cache: false,
+            groups: groups.into_iter().collect(),
+            all_groups: false,
+        },
+    )?;
 
     println!(
         "installed {} [{}]@{} and resolved dependencies",
@@ -1834,24 +2260,28 @@ fn cmd_tree(
     invert: Option<String>,
     all: bool,
     source: Option<SourceArg>,
+    groups: Vec<String>,
+    all_groups: bool,
 ) -> Result<()> {
     let manifest = load_manifest(root)?;
     let lock = load_lockfile_required(root)?;
     ensure_lock_dependency_graph(&lock)?;
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
     let graph = LockGraph::from_lock(&lock);
     let source_filter = source.map(SourceArg::to_core);
 
     let output = if let Some(query) = invert.as_deref() {
-        let target = resolve_locked_package(&lock, query, source_filter)?;
-        render_reverse_dependency_tree(&graph, target)
+        let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
+        render_reverse_dependency_tree(&graph, target, &active_groups)
     } else if all {
-        let packages = sorted_lock_packages(&lock);
+        let packages = sorted_lock_packages(&lock, &active_groups);
         render_forward_dependency_forest(&graph, &packages)
     } else if let Some(query) = id.as_deref() {
-        let target = resolve_locked_package(&lock, query, source_filter)?;
+        let target = resolve_locked_package(&lock, query, source_filter, &active_groups)?;
         render_forward_dependency_forest(&graph, &[target])
     } else {
-        let roots = resolve_manifest_root_packages(&manifest, &lock)?;
+        let roots = resolve_manifest_root_packages(&manifest, &lock, &active_groups)?;
         render_forward_dependency_forest(&graph, &roots)
     };
 
@@ -1859,13 +2289,21 @@ fn cmd_tree(
     Ok(())
 }
 
-fn cmd_why(root: &Path, id: &str, source: Option<SourceArg>) -> Result<()> {
+fn cmd_why(
+    root: &Path,
+    id: &str,
+    source: Option<SourceArg>,
+    groups: Vec<String>,
+    all_groups: bool,
+) -> Result<()> {
     let manifest = load_manifest(root)?;
     let lock = load_lockfile_required(root)?;
     ensure_lock_dependency_graph(&lock)?;
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
     let graph = LockGraph::from_lock(&lock);
-    let roots = resolve_manifest_root_packages(&manifest, &lock)?;
-    let target = resolve_locked_package(&lock, id, source.map(SourceArg::to_core))?;
+    let roots = resolve_manifest_root_packages(&manifest, &lock, &active_groups)?;
+    let target = resolve_locked_package(&lock, id, source.map(SourceArg::to_core), &active_groups)?;
     let output = render_why_report(&graph, &roots, target)?;
     print!("{output}");
     Ok(())
@@ -2006,15 +2444,29 @@ fn render_forward_dependency_forest(graph: &LockGraph<'_>, roots: &[&LockedPacka
     }
 }
 
-fn render_reverse_dependency_tree(graph: &LockGraph<'_>, root: &LockedPackage) -> String {
-    let mut lines = Vec::new();
+fn render_reverse_dependency_tree(
+    graph: &LockGraph<'_>,
+    root: &LockedPackage,
+    groups: &BTreeSet<String>,
+) -> String {
+    let mut state = ReverseTreeRenderState {
+        groups,
+        path: Vec::new(),
+        lines: Vec::new(),
+    };
     let key = locked_package_graph_key(root);
-    render_reverse_tree_node(graph, &key, "", true, None, &mut Vec::new(), &mut lines);
-    if lines.is_empty() {
+    render_reverse_tree_node(graph, &key, "", true, None, &mut state);
+    if state.lines.is_empty() {
         String::new()
     } else {
-        format!("{}\n", lines.join("\n"))
+        format!("{}\n", state.lines.join("\n"))
     }
+}
+
+struct ReverseTreeRenderState<'a> {
+    groups: &'a BTreeSet<String>,
+    path: Vec<String>,
+    lines: Vec<String>,
 }
 
 fn render_forward_tree_node(
@@ -2080,8 +2532,7 @@ fn render_reverse_tree_node(
     prefix: &str,
     is_last: bool,
     incoming: Option<&ReverseLockGraphEdge>,
-    path: &mut Vec<String>,
-    lines: &mut Vec<String>,
+    state: &mut ReverseTreeRenderState<'_>,
 ) {
     let connector = if incoming.is_none() {
         ""
@@ -2091,8 +2542,10 @@ fn render_reverse_tree_node(
         "|-- "
     };
 
-    if path.iter().any(|entry| entry == key) {
-        lines.push(format!("{prefix}{connector}{key} (cycle)"));
+    if state.path.iter().any(|entry| entry == key) {
+        state
+            .lines
+            .push(format!("{prefix}{connector}{key} (cycle)"));
         return;
     }
 
@@ -2103,9 +2556,11 @@ fn render_reverse_tree_node(
     let edge_label = incoming
         .map(format_reverse_tree_edge_label)
         .unwrap_or_default();
-    lines.push(format!("{prefix}{connector}{label}{edge_label}"));
+    state
+        .lines
+        .push(format!("{prefix}{connector}{label}{edge_label}"));
 
-    path.push(key.to_string());
+    state.path.push(key.to_string());
     let child_prefix = if incoming.is_none() {
         String::new()
     } else if is_last {
@@ -2115,18 +2570,25 @@ fn render_reverse_tree_node(
     };
 
     let edges = graph.reverse_edges.get(key).cloned().unwrap_or_default();
-    for (index, edge) in edges.iter().enumerate() {
+    let visible_edges: Vec<ReverseLockGraphEdge> = edges
+        .into_iter()
+        .filter(|edge| {
+            graph
+                .package(&edge.dependent_key)
+                .is_some_and(|package| package_in_groups(package, state.groups))
+        })
+        .collect();
+    for (index, edge) in visible_edges.iter().enumerate() {
         render_reverse_tree_node(
             graph,
             &edge.dependent_key,
             &child_prefix,
-            index + 1 == edges.len(),
+            index + 1 == visible_edges.len(),
             Some(edge),
-            path,
-            lines,
+            state,
         );
     }
-    path.pop();
+    state.path.pop();
 }
 
 fn format_tree_edge_label(edge: &LockGraphEdge) -> String {
@@ -2155,20 +2617,21 @@ fn ensure_lock_dependency_graph(lock: &Lockfile) -> Result<()> {
 fn resolve_manifest_root_packages<'a>(
     manifest: &Manifest,
     lock: &'a Lockfile,
+    groups: &BTreeSet<String>,
 ) -> Result<Vec<&'a LockedPackage>> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
 
-    for spec in &manifest.mods {
+    for (group, spec) in selected_manifest_specs(manifest, groups) {
+        let single_group = BTreeSet::from([group.clone()]);
         let package = lock
             .packages
             .iter()
-            .find(|package| lock_package_matches_spec(package, spec))
+            .find(|package| package_in_groups(package, &single_group) && lock_package_matches_spec(package, spec))
             .with_context(|| {
                 format!(
-                    "manifest entry `{}` [{}] is not present in lockfile; rerun `mineconda lock`",
-                    spec.id,
-                    spec.source.as_str()
+                    "manifest entry `{}` [{}] in group `{}` is not present in lockfile; rerun `mineconda lock`",
+                    spec.id, spec.source.as_str(), group
                 )
             })?;
         let key = locked_package_graph_key(package);
@@ -2184,11 +2647,14 @@ fn resolve_locked_package<'a>(
     lock: &'a Lockfile,
     id: &str,
     source: Option<ModSource>,
+    groups: &BTreeSet<String>,
 ) -> Result<&'a LockedPackage> {
     let matches: Vec<&LockedPackage> = lock
         .packages
         .iter()
-        .filter(|package| lock_package_matches_request(package, id, source))
+        .filter(|package| {
+            package_in_groups(package, groups) && lock_package_matches_request(package, id, source)
+        })
         .collect();
 
     match matches.as_slice() {
@@ -2198,8 +2664,15 @@ fn resolve_locked_package<'a>(
     }
 }
 
-fn sorted_lock_packages(lock: &Lockfile) -> Vec<&LockedPackage> {
-    let mut packages: Vec<&LockedPackage> = lock.packages.iter().collect();
+fn sorted_lock_packages<'a>(
+    lock: &'a Lockfile,
+    groups: &BTreeSet<String>,
+) -> Vec<&'a LockedPackage> {
+    let mut packages: Vec<&LockedPackage> = lock
+        .packages
+        .iter()
+        .filter(|package| package_in_groups(package, groups))
+        .collect();
     packages.sort_by(|left, right| {
         locked_package_graph_key(left).cmp(&locked_package_graph_key(right))
     });
@@ -2223,9 +2696,14 @@ fn locked_package_display(package: &LockedPackage) -> String {
     )
 }
 
-fn cmd_lock(root: &Path, upgrade: bool) -> Result<()> {
+fn cmd_lock(root: &Path, upgrade: bool, groups: Vec<String>, all_groups: bool) -> Result<()> {
     let manifest = load_manifest(root)?;
-    write_lock_from_manifest(root, &manifest, upgrade)
+    write_lock_from_manifest(
+        root,
+        &manifest,
+        upgrade,
+        activation_groups(&manifest, &groups, all_groups)?,
+    )
 }
 
 fn cmd_cache(root: &Path, command: CacheCommands) -> Result<()> {
@@ -2790,21 +3268,37 @@ fn java_command_exists(command: &str, root: &Path) -> bool {
     false
 }
 
-fn cmd_sync(
-    root: &Path,
-    prune: bool,
-    locked: bool,
-    offline: bool,
-    jobs: usize,
-    verbose_cache: bool,
-) -> Result<()> {
+fn cmd_sync(root: &Path, args: SyncCommandArgs) -> Result<()> {
+    let SyncCommandArgs {
+        prune,
+        locked,
+        offline,
+        jobs,
+        verbose_cache,
+        groups,
+        all_groups,
+    } = args;
     let manifest = load_manifest_optional(root)?;
     if jobs == 0 {
         bail!("sync --jobs must be >= 1");
     }
     let mut lock = load_lockfile_required(root)?;
+    let active_groups = if let Some(manifest) = manifest.as_ref() {
+        let groups = activation_groups(manifest, &groups, all_groups)?;
+        ensure_lock_covers_groups(manifest, &lock, &groups)?;
+        groups
+    } else if !groups.is_empty() || all_groups {
+        bail!("group filters require a manifest");
+    } else {
+        BTreeSet::new()
+    };
+    let mut sync_lock = if active_groups.is_empty() {
+        lock.clone()
+    } else {
+        filtered_lockfile(&lock, &active_groups)
+    };
     let report = sync_lockfile(
-        &mut lock,
+        &mut sync_lock,
         &SyncRequest {
             project_root: root.to_path_buf(),
             prune,
@@ -2823,6 +3317,11 @@ fn cmd_sync(
                 "sync would update lockfile metadata in --locked/--frozen mode; run `mineconda sync` without lock guards first"
             );
         }
+        if active_groups.is_empty() {
+            lock = sync_lock;
+        } else {
+            merge_synced_lock_packages(&mut lock, &sync_lock);
+        }
         let path = lockfile_path(root);
         write_lockfile(&path, &lock)
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -2840,6 +3339,21 @@ fn cmd_sync(
         report.failed
     );
     Ok(())
+}
+
+fn merge_synced_lock_packages(lock: &mut Lockfile, synced: &Lockfile) {
+    let synced_by_key: HashMap<String, &LockedPackage> = synced
+        .packages
+        .iter()
+        .map(|package| (locked_package_graph_key(package), package))
+        .collect();
+
+    for package in &mut lock.packages {
+        let key = locked_package_graph_key(package);
+        if let Some(updated) = synced_by_key.get(&key) {
+            *package = (*updated).clone();
+        }
+    }
 }
 
 fn cmd_cache_ls(root: &Path) -> Result<()> {
@@ -3050,6 +3564,8 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
         instance,
         launcher_jar,
         server_jar,
+        groups,
+        all_groups,
     } = args;
 
     let manifest = load_manifest_optional(root)?;
@@ -3061,6 +3577,26 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
     let loader_hint = manifest
         .as_ref()
         .map(|manifest| to_run_loader_hint(manifest.project.loader.kind));
+    let package_paths = if let Some(manifest) = manifest.as_ref() {
+        let active_groups = activation_groups(manifest, &groups, all_groups)?;
+        if manifest.groups.is_empty() && active_groups.len() == 1 {
+            None
+        } else {
+            let lock = load_lockfile_required(root)?;
+            ensure_lock_covers_groups(manifest, &lock, &active_groups)?;
+            Some(
+                filtered_lockfile(&lock, &active_groups)
+                    .packages
+                    .into_iter()
+                    .map(|package| package.install_path_or_default())
+                    .collect(),
+            )
+        }
+    } else if !groups.is_empty() || all_groups {
+        bail!("group filters require a manifest");
+    } else {
+        None
+    };
     let args = if jvm_args.is_empty() {
         defaults.jvm_args.clone()
     } else {
@@ -3101,14 +3637,25 @@ fn cmd_run(root: &Path, args: RunCommandArgs) -> Result<()> {
         loader_hint,
         client_launcher_jar,
         server_launcher_jar,
+        package_paths,
     };
     run_game_instance(&request)?;
     Ok(())
 }
 
-fn cmd_export(root: &Path, format: ExportArg, output: PathBuf) -> Result<()> {
-    let mut manifest = load_manifest(root)?;
-    let mut lock = load_lockfile_required(root)?;
+fn cmd_export(
+    root: &Path,
+    format: ExportArg,
+    output: PathBuf,
+    groups: Vec<String>,
+    all_groups: bool,
+) -> Result<()> {
+    let manifest = load_manifest(root)?;
+    let lock = load_lockfile_required(root)?;
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    ensure_lock_covers_groups(&manifest, &lock, &active_groups)?;
+    let mut manifest = filtered_manifest_for_export(&manifest, &active_groups);
+    let mut lock = filtered_lockfile(&lock, &active_groups);
     if matches!(format, ExportArg::Curseforge | ExportArg::Multimc) {
         eprintln!(
             "warning: `{}` export is compatibility-oriented and not part of the stable import/export baseline; validate it with your target launcher",
@@ -3444,9 +3991,21 @@ fn cmd_env_which(root: &Path) -> Result<()> {
     }
 }
 
+fn validate_manifest_groups(manifest: &Manifest) -> Result<()> {
+    for group in manifest.groups.0.keys() {
+        if !is_valid_group_name(group) {
+            bail!("manifest contains invalid group name `{group}`");
+        }
+    }
+    Ok(())
+}
+
 fn load_manifest(root: &Path) -> Result<Manifest> {
     let path = manifest_path(root);
-    read_manifest(&path).with_context(|| format!("failed to read {}", path.display()))
+    let manifest =
+        read_manifest(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    validate_manifest_groups(&manifest)?;
+    Ok(manifest)
 }
 
 fn load_manifest_optional(root: &Path) -> Result<Option<Manifest>> {
@@ -3456,6 +4015,7 @@ fn load_manifest_optional(root: &Path) -> Result<Option<Manifest>> {
     }
     let manifest =
         read_manifest(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    validate_manifest_groups(&manifest)?;
     Ok(Some(manifest))
 }
 
@@ -3473,9 +4033,18 @@ fn load_lockfile_required(root: &Path) -> Result<Lockfile> {
     load_lockfile_optional(root)?.context("lockfile not found, run `mineconda lock` first")
 }
 
-fn write_lock_from_manifest(root: &Path, manifest: &Manifest, upgrade: bool) -> Result<()> {
+fn write_lock_from_manifest(
+    root: &Path,
+    manifest: &Manifest,
+    upgrade: bool,
+    groups: BTreeSet<String>,
+) -> Result<()> {
     let old_lock = load_lockfile_optional(root)?;
-    let output = resolve_lockfile(manifest, old_lock.as_ref(), &ResolveRequest { upgrade })?;
+    let output = resolve_lockfile(
+        manifest,
+        old_lock.as_ref(),
+        &ResolveRequest { upgrade, groups },
+    )?;
     let path = lockfile_path(root);
     write_lockfile(&path, &output.lockfile)
         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -3598,10 +4167,12 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use mineconda_core::{
-        LoaderKind, LoaderSpec, LockMetadata, LockedDependency, LockedDependencyKind,
-        LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec, ProjectSection,
-        RuntimeProfile, ServerProfile,
+        DEFAULT_GROUP_NAME, LoaderKind, LoaderSpec, LockMetadata, LockedDependency,
+        LockedDependencyKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
+        ProjectSection, RuntimeProfile, ServerProfile,
     };
     use mineconda_resolver::{SearchResult, SearchSource};
 
@@ -3683,6 +4254,7 @@ mod tests {
             source_ref: Some(
                 "requested=embeddium;project=sk9rgfiA;version=J7b96IEd;name=Embeddium".to_string(),
             ),
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
             dependencies: Vec::new(),
         };
 
@@ -3734,11 +4306,38 @@ mod tests {
                 },
             },
             mods,
+            groups: Default::default(),
             sources: Default::default(),
             cache: Default::default(),
             server: ServerProfile::default(),
             runtime: RuntimeProfile::default(),
         }
+    }
+
+    fn test_manifest_with_client_group() -> Manifest {
+        toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "jei"
+source = "modrinth"
+version = "latest"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "iris", source = "modrinth", version = "latest", side = "client" }
+]
+"#,
+        )
+        .expect("manifest should parse")
     }
 
     fn test_lockfile(packages: Vec<LockedPackage>) -> Lockfile {
@@ -3752,6 +4351,7 @@ mod tests {
                     version: "latest".to_string(),
                 },
                 dependency_graph: true,
+                group_metadata: true,
             },
             packages,
         }
@@ -3775,6 +4375,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn activation_groups_include_default_plus_requested_extras() {
+        let manifest = test_manifest_with_client_group();
+        let groups = super::activation_groups(&manifest, &["client".to_string()], false)
+            .expect("active groups");
+        assert_eq!(
+            groups,
+            BTreeSet::from([DEFAULT_GROUP_NAME.to_string(), "client".to_string()])
+        );
+    }
+
+    #[test]
+    fn edit_groups_target_only_requested_group() {
+        let manifest = test_manifest_with_client_group();
+        let groups =
+            super::edit_groups(&manifest, &["client".to_string()], false).expect("edit groups");
+        assert_eq!(groups, vec!["client".to_string()]);
+    }
+
     fn test_package(id: &str, version: &str, dependencies: Vec<LockedDependency>) -> LockedPackage {
         LockedPackage {
             id: id.to_string(),
@@ -3790,6 +4409,7 @@ mod tests {
             source_ref: Some(format!(
                 "requested={id};project={id};version={version};name={id}"
             )),
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
             dependencies,
         }
     }
@@ -3820,8 +4440,9 @@ mod tests {
         let gamma = test_package("gamma", "1.2.0", Vec::new());
         let lock = test_lockfile(vec![alpha, beta.clone(), gamma.clone()]);
         let graph = super::LockGraph::from_lock(&lock);
+        let groups = BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]);
 
-        let output = render_reverse_dependency_tree(&graph, &gamma);
+        let output = render_reverse_dependency_tree(&graph, &gamma, &groups);
         assert_eq!(
             output,
             concat!(
@@ -3870,8 +4491,9 @@ mod tests {
         ]);
         let lock = test_lockfile(vec![alpha.clone(), beta, delta.clone(), gamma.clone()]);
         let graph = super::LockGraph::from_lock(&lock);
-        let roots =
-            super::resolve_manifest_root_packages(&manifest, &lock).expect("manifest roots");
+        let groups = BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]);
+        let roots = super::resolve_manifest_root_packages(&manifest, &lock, &groups)
+            .expect("manifest roots");
 
         let output = render_why_report(&graph, &roots, &gamma).expect("transitive why report");
         assert_eq!(

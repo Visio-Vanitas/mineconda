@@ -5,8 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mineconda_core::{
-    HashAlgorithm, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
-    PackageHash,
+    DEFAULT_GROUP_NAME, HashAlgorithm, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide,
+    ModSource, ModSpec, PackageHash,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -364,6 +364,7 @@ fn import_mrpack(request: &ImportRequest) -> Result<ImportResult> {
             download_url: first_download,
             hashes: lock_hashes,
             source_ref,
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
             dependencies: Vec::new(),
         });
     }
@@ -1032,6 +1033,7 @@ mod tests {
                     },
                 ],
                 source_ref: Some("project=abc;version=v1".to_string()),
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             }],
         };
@@ -1074,6 +1076,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             }],
         };
@@ -1102,6 +1105,7 @@ mod tests {
                     value: "sha1v".to_string(),
                 }],
                 source_ref: None,
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             }],
         };
@@ -1288,6 +1292,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             }],
         };
@@ -1326,6 +1331,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                groups: vec![DEFAULT_GROUP_NAME.to_string()],
                 dependencies: Vec::new(),
             }],
         };
@@ -1386,6 +1392,7 @@ mod tests {
                     download_url: "https://example.com/valid.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: Some("mod=325492;file=5940240".to_string()),
+                    groups: vec![DEFAULT_GROUP_NAME.to_string()],
                     dependencies: Vec::new(),
                 },
                 LockedPackage {
@@ -1400,6 +1407,7 @@ mod tests {
                     download_url: "https://example.com/invalid.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: Some("mod=348521;file=6150677".to_string()),
+                    groups: vec![DEFAULT_GROUP_NAME.to_string()],
                     dependencies: Vec::new(),
                 },
                 LockedPackage {
@@ -1414,6 +1422,7 @@ mod tests {
                     download_url: "https://example.com/other.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: None,
+                    groups: vec![DEFAULT_GROUP_NAME.to_string()],
                     dependencies: Vec::new(),
                 },
             ],
@@ -1447,6 +1456,7 @@ mod tests {
                 install_path: None,
                 side: ModSide::Both,
             }],
+            groups: Default::default(),
             sources: SourceRegistry::default(),
             cache: Default::default(),
             server: ServerProfile::default(),
@@ -1464,6 +1474,7 @@ mod tests {
                 version: "latest".to_string(),
             },
             dependency_graph: true,
+            group_metadata: true,
         }
     }
 

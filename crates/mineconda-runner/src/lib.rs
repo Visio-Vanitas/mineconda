@@ -53,6 +53,7 @@ pub struct RunRequest {
     pub loader_hint: Option<LoaderHint>,
     pub client_launcher_jar: Option<PathBuf>,
     pub server_launcher_jar: Option<PathBuf>,
+    pub package_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,18 +189,42 @@ fn prepare_launch_inputs(request: &RunRequest, plan: &RunPlan) -> Result<()> {
         if prepared.contains(&launch.instance_dir) {
             continue;
         }
-        stage_project_inputs(&request.root, &launch.instance_dir)?;
+        stage_project_inputs(
+            &request.root,
+            &launch.instance_dir,
+            request.package_paths.as_deref(),
+        )?;
         prepared.push(launch.instance_dir.clone());
     }
     Ok(())
 }
 
-fn stage_project_inputs(root: &Path, instance_dir: &Path) -> Result<()> {
+fn stage_project_inputs(
+    root: &Path,
+    instance_dir: &Path,
+    package_paths: Option<&[String]>,
+) -> Result<()> {
     for relative in STAGED_DIRS {
+        if package_paths.is_some() && *relative == "mods" {
+            continue;
+        }
         stage_selected_path(root, instance_dir, relative)?;
     }
     for relative in STAGED_FILES {
         stage_selected_path(root, instance_dir, relative)?;
+    }
+    if let Some(package_paths) = package_paths {
+        stage_package_paths(root, instance_dir, package_paths)?;
+    }
+    Ok(())
+}
+
+fn stage_package_paths(root: &Path, instance_dir: &Path, package_paths: &[String]) -> Result<()> {
+    let mut paths = package_paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    for relative in paths {
+        stage_selected_path(root, instance_dir, &relative)?;
     }
     Ok(())
 }
@@ -671,6 +696,7 @@ mod tests {
             loader_hint,
             client_launcher_jar: None,
             server_launcher_jar: None,
+            package_paths: None,
         }
     }
 
@@ -799,6 +825,30 @@ mod tests {
                 .expect("read server.properties"),
             "motd=mineconda\n"
         );
+    }
+
+    #[test]
+    fn prepare_launch_inputs_filters_package_paths_when_requested() {
+        let ws = TempWorkspace::new("stage-filtered-packages");
+        write_file(&ws.root.join(".mineconda/dev/neoforge-server-launch.jar"));
+        write_file(&ws.root.join("mods/client-only.jar"));
+        write_file(&ws.root.join("mods/server-only.jar"));
+        write_file(&ws.root.join("config/example.toml"));
+
+        let mut request = request(&ws.root, RunMode::Server, Some(LoaderHint::NeoForge));
+        request.package_paths = Some(vec!["mods/client-only.jar".to_string()]);
+        let plan = build_run_plan(&request).expect("failed to build run plan");
+        prepare_launch_inputs(&request, &plan).expect("failed to prepare launch inputs");
+
+        let server = plan
+            .launches
+            .iter()
+            .find(|entry| entry.role == LaunchRole::Server)
+            .expect("server plan");
+
+        assert!(server.instance_dir.join("mods/client-only.jar").exists());
+        assert!(!server.instance_dir.join("mods/server-only.jar").exists());
+        assert!(server.instance_dir.join("config/example.toml").exists());
     }
 
     #[test]

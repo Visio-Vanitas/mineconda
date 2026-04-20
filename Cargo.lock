@@ -1141,6 +1141,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
