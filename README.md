@@ -85,6 +85,7 @@ Useful package-state commands:
 
 - `mineconda lock diff` previews lockfile changes without writing them
 - `mineconda status` reports manifest/lock/sync drift for the selected groups
+- add `--json` to either command for machine-readable output and stable `0/2/1` exit codes
 
 ## Dependency Groups
 

@@ -34,6 +34,7 @@ use mineconda_sync::{
     collect_cache_stats, remote_prune_s3_cache, sync_lockfile, verify_cache_entries,
 };
 use reqwest::blocking::Client;
+use serde::Serialize;
 use terminal_size::{Width, terminal_size};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -188,6 +189,8 @@ enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        json: bool,
     },
     Cache {
         #[command(subcommand)]
@@ -299,7 +302,10 @@ enum GroupCommands {
 
 #[derive(Subcommand, Debug)]
 enum LockCommands {
-    Diff,
+    Diff {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -582,6 +588,19 @@ impl LockDiffKind {
             Self::ChangeDependencies => "CHANGE DEPENDENCIES",
         }
     }
+
+    fn json_label(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Upgrade => "upgrade",
+            Self::Downgrade => "downgrade",
+            Self::ChangeVersion => "change_version",
+            Self::ChangeArtifact => "change_artifact",
+            Self::ChangeGroups => "change_groups",
+            Self::ChangeDependencies => "change_dependencies",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -603,6 +622,119 @@ struct LockDiffEntry {
 struct CommandReport {
     output: String,
     exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JsonErrorReport {
+    command: &'static str,
+    groups: Vec<String>,
+    error: String,
+    exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockDiffJsonSummary {
+    install: usize,
+    remove: usize,
+    unchanged: usize,
+    changes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockDependencyJson {
+    source: String,
+    id: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockDiffJsonEntry {
+    kind: String,
+    id: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_version: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    current_groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    desired_groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    current_dependencies: Vec<LockDependencyJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    desired_dependencies: Vec<LockDependencyJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LockDiffJsonReport {
+    command: &'static str,
+    groups: Vec<String>,
+    summary: LockDiffJsonSummary,
+    entries: Vec<LockDiffJsonEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonSummary {
+    state: &'static str,
+    exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonManifest {
+    exists: bool,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roots: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    named_groups: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonLockfile {
+    exists: bool,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_graph: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_metadata: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonSync {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    missing: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packages: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonChecks {
+    project_metadata: &'static str,
+    group_coverage: &'static str,
+    resolution: &'static str,
+    sync: StatusJsonSync,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusJsonReport {
+    command: &'static str,
+    groups: Vec<String>,
+    summary: StatusJsonSummary,
+    manifest: StatusJsonManifest,
+    lockfile: StatusJsonLockfile,
+    checks: StatusJsonChecks,
+    messages: Vec<String>,
 }
 
 fn normalize_group_selector(raw: &str) -> Result<String> {
@@ -771,6 +903,20 @@ fn format_active_groups(groups: &BTreeSet<String>) -> String {
     format_group_list(&groups.iter().cloned().collect::<Vec<_>>())
 }
 
+fn requested_groups_fallback(groups: &[String], all_groups: bool) -> Vec<String> {
+    if all_groups {
+        return vec![DEFAULT_GROUP_NAME.to_string()];
+    }
+
+    let mut out = BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]);
+    for raw in groups {
+        if let Ok(group) = normalize_group_selector(raw) {
+            out.insert(group);
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn normalized_package_groups(package: &LockedPackage) -> Vec<String> {
     let mut groups = if package.groups.is_empty() {
         vec![DEFAULT_GROUP_NAME.to_string()]
@@ -841,6 +987,15 @@ fn format_dependency_list(dependencies: &[LockedDependency]) -> String {
         .map(dependency_signature)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn dependency_to_json(dependency: &LockedDependency) -> LockDependencyJson {
+    LockDependencyJson {
+        source: dependency.source.as_str().to_string(),
+        id: dependency.id.clone(),
+        kind: dependency.kind.as_str().to_string(),
+        constraint: dependency.constraint.clone(),
+    }
 }
 
 fn version_number_tokens(raw: &str) -> Vec<u64> {
@@ -1009,6 +1164,30 @@ fn compute_lock_diff_entries(current: Option<&Lockfile>, desired: &Lockfile) -> 
     entries
 }
 
+fn lock_diff_entry_to_json(entry: &LockDiffEntry) -> LockDiffJsonEntry {
+    LockDiffJsonEntry {
+        kind: entry.kind.json_label().to_string(),
+        id: entry.id.clone(),
+        source: entry.source.as_str().to_string(),
+        current_version: entry.current_version.clone(),
+        desired_version: entry.desired_version.clone(),
+        current_groups: entry.current_groups.clone(),
+        desired_groups: entry.desired_groups.clone(),
+        current_dependencies: entry
+            .current_dependencies
+            .iter()
+            .map(dependency_to_json)
+            .collect(),
+        desired_dependencies: entry
+            .desired_dependencies
+            .iter()
+            .map(dependency_to_json)
+            .collect(),
+        current_artifact: entry.current_artifact.clone(),
+        desired_artifact: entry.desired_artifact.clone(),
+    }
+}
+
 fn render_lock_diff_entry(entry: &LockDiffEntry) -> String {
     let prefix = format!(
         "{} {} [{}]",
@@ -1145,10 +1324,16 @@ fn main() -> Result<()> {
             groups,
             all_groups,
         } => match command {
-            Some(LockCommands::Diff) => cmd_lock_diff(&root, upgrade, groups, all_groups)?,
+            Some(LockCommands::Diff { json }) => {
+                cmd_lock_diff(&root, upgrade, groups, all_groups, json)?
+            }
             None => cmd_lock(&root, upgrade, groups, all_groups)?,
         },
-        Commands::Status { groups, all_groups } => cmd_status(&root, groups, all_groups)?,
+        Commands::Status {
+            groups,
+            all_groups,
+            json,
+        } => cmd_status(&root, groups, all_groups, json)?,
         Commands::Cache { command } => cmd_cache(&root, command)?,
         Commands::Env { command } => cmd_env(&root, command)?,
         Commands::Sync {
@@ -3077,28 +3262,185 @@ fn emit_command_report(report: CommandReport) -> Result<()> {
     Ok(())
 }
 
-fn build_lock_diff_report(
+fn emit_json_report<T: Serialize>(report: &T, exit_code: i32) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).context("failed to encode json report")?
+    );
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+    if exit_code != 0 {
+        process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn command_display_name(command: &str) -> &str {
+    match command {
+        "lock-diff" => "lock diff",
+        "status" => "status",
+        _ => command,
+    }
+}
+
+fn json_error_report(
+    command: &'static str,
+    groups: Vec<String>,
+    error: impl Into<String>,
+    exit_code: i32,
+) -> JsonErrorReport {
+    JsonErrorReport {
+        command,
+        groups,
+        error: format!("{}: {}", command_display_name(command), error.into()),
+        exit_code,
+    }
+}
+
+fn render_json_error_report(report: &JsonErrorReport) -> CommandReport {
+    CommandReport {
+        output: format!("{}\n", report.error),
+        exit_code: report.exit_code,
+    }
+}
+
+fn render_lock_diff_json_report(report: &LockDiffJsonReport) -> CommandReport {
+    let mut lines = vec![format!(
+        "lock diff: groups={} install={} remove={} unchanged={} changes={}",
+        format_group_list(&report.groups),
+        report.summary.install,
+        report.summary.remove,
+        report.summary.unchanged,
+        report.summary.changes
+    )];
+    if report.entries.is_empty() {
+        lines.push("lock diff: no changes".to_string());
+        return CommandReport {
+            output: format!("{}\n", lines.join("\n")),
+            exit_code: 0,
+        };
+    }
+
+    lines.extend(report.entries.iter().map(|entry| {
+        render_lock_diff_entry(&LockDiffEntry {
+            kind: match entry.kind.as_str() {
+                "add" => LockDiffKind::Add,
+                "remove" => LockDiffKind::Remove,
+                "upgrade" => LockDiffKind::Upgrade,
+                "downgrade" => LockDiffKind::Downgrade,
+                "change_version" => LockDiffKind::ChangeVersion,
+                "change_artifact" => LockDiffKind::ChangeArtifact,
+                "change_groups" => LockDiffKind::ChangeGroups,
+                "change_dependencies" => LockDiffKind::ChangeDependencies,
+                _ => LockDiffKind::ChangeVersion,
+            },
+            id: entry.id.clone(),
+            source: match entry.source.as_str() {
+                "modrinth" => ModSource::Modrinth,
+                "curseforge" => ModSource::Curseforge,
+                "url" => ModSource::Url,
+                "local" => ModSource::Local,
+                "s3" => ModSource::S3,
+                _ => ModSource::Local,
+            },
+            current_version: entry.current_version.clone(),
+            desired_version: entry.desired_version.clone(),
+            current_groups: entry.current_groups.clone(),
+            desired_groups: entry.desired_groups.clone(),
+            current_dependencies: entry
+                .current_dependencies
+                .iter()
+                .map(|dep| LockedDependency {
+                    source: match dep.source.as_str() {
+                        "modrinth" => ModSource::Modrinth,
+                        "curseforge" => ModSource::Curseforge,
+                        "url" => ModSource::Url,
+                        "local" => ModSource::Local,
+                        "s3" => ModSource::S3,
+                        _ => ModSource::Local,
+                    },
+                    id: dep.id.clone(),
+                    kind: match dep.kind.as_str() {
+                        "required" => LockedDependencyKind::Required,
+                        "incompatible" => LockedDependencyKind::Incompatible,
+                        _ => LockedDependencyKind::Required,
+                    },
+                    constraint: dep.constraint.clone(),
+                })
+                .collect(),
+            desired_dependencies: entry
+                .desired_dependencies
+                .iter()
+                .map(|dep| LockedDependency {
+                    source: match dep.source.as_str() {
+                        "modrinth" => ModSource::Modrinth,
+                        "curseforge" => ModSource::Curseforge,
+                        "url" => ModSource::Url,
+                        "local" => ModSource::Local,
+                        "s3" => ModSource::S3,
+                        _ => ModSource::Local,
+                    },
+                    id: dep.id.clone(),
+                    kind: match dep.kind.as_str() {
+                        "required" => LockedDependencyKind::Required,
+                        "incompatible" => LockedDependencyKind::Incompatible,
+                        _ => LockedDependencyKind::Required,
+                    },
+                    constraint: dep.constraint.clone(),
+                })
+                .collect(),
+            current_artifact: entry.current_artifact.clone(),
+            desired_artifact: entry.desired_artifact.clone(),
+        })
+    }));
+
+    CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 2,
+    }
+}
+
+fn render_status_json_report(report: &StatusJsonReport) -> CommandReport {
+    let mut lines = vec![if report.summary.state == "drift" {
+        "status summary: drift detected".to_string()
+    } else {
+        "status summary: clean".to_string()
+    }];
+    lines.extend(report.messages.clone());
+    CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: report.summary.exit_code,
+    }
+}
+
+fn build_lock_diff_json_report(
     root: &Path,
     upgrade: bool,
     groups: Vec<String>,
     all_groups: bool,
-) -> Result<CommandReport> {
+) -> Result<std::result::Result<LockDiffJsonReport, JsonErrorReport>> {
     let manifest = load_manifest(root)?;
     let active_groups = activation_groups(&manifest, &groups, all_groups)?;
     let current = load_lockfile_optional(root)?;
+    let groups = active_groups.iter().cloned().collect::<Vec<_>>();
 
     if let Some(lock) = current.as_ref() {
         if !lock.metadata.dependency_graph {
-            return Ok(CommandReport {
-                output: "lock diff: lockfile does not contain dependency graph data; rerun `mineconda lock` first\n".to_string(),
-                exit_code: 2,
-            });
+            return Ok(Err(json_error_report(
+                "lock-diff",
+                groups,
+                "lockfile does not contain dependency graph data; rerun `mineconda lock` first",
+                2,
+            )));
         }
         if let Err(err) = ensure_lock_group_metadata(&manifest, lock, &active_groups) {
-            return Ok(CommandReport {
-                output: format!("lock diff: {err}\n"),
-                exit_code: 2,
-            });
+            return Ok(Err(json_error_report(
+                "lock-diff",
+                groups,
+                err.to_string(),
+                2,
+            )));
         }
     }
 
@@ -3111,70 +3453,123 @@ fn build_lock_diff_report(
         },
     )?;
     let entries = compute_lock_diff_entries(current.as_ref(), &output.lockfile);
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "lock diff: groups={} install={} remove={} unchanged={} changes={}",
-        format_active_groups(&active_groups),
-        output.plan.install.len(),
-        output.plan.remove.len(),
-        output.plan.unchanged.len(),
-        entries.len()
-    ));
-    if entries.is_empty() {
-        lines.push("lock diff: no changes".to_string());
-        return Ok(CommandReport {
-            output: format!("{}\n", lines.join("\n")),
-            exit_code: 0,
-        });
+    Ok(Ok(LockDiffJsonReport {
+        command: "lock-diff",
+        groups,
+        summary: LockDiffJsonSummary {
+            install: output.plan.install.len(),
+            remove: output.plan.remove.len(),
+            unchanged: output.plan.unchanged.len(),
+            changes: entries.len(),
+        },
+        entries: entries.iter().map(lock_diff_entry_to_json).collect(),
+    }))
+}
+
+fn cmd_lock_diff(
+    root: &Path,
+    upgrade: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    json: bool,
+) -> Result<()> {
+    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    if json {
+        match build_lock_diff_json_report(root, upgrade, groups, all_groups) {
+            Ok(Ok(report)) => {
+                let exit_code = if report.entries.is_empty() { 0 } else { 2 };
+                emit_json_report(&report, exit_code)
+            }
+            Ok(Err(error)) => emit_json_report(&error, error.exit_code),
+            Err(err) => emit_json_report(
+                &json_error_report("lock-diff", fallback_groups, format!("{err:#}"), 1),
+                1,
+            ),
+        }
+    } else {
+        match build_lock_diff_json_report(root, upgrade, groups, all_groups)? {
+            Ok(report) => emit_command_report(render_lock_diff_json_report(&report)),
+            Err(error) => emit_command_report(render_json_error_report(&error)),
+        }
     }
-
-    lines.extend(entries.iter().map(render_lock_diff_entry));
-    Ok(CommandReport {
-        output: format!("{}\n", lines.join("\n")),
-        exit_code: 2,
-    })
 }
 
-fn cmd_lock_diff(root: &Path, upgrade: bool, groups: Vec<String>, all_groups: bool) -> Result<()> {
-    emit_command_report(build_lock_diff_report(root, upgrade, groups, all_groups)?)
-}
-
-fn build_status_report(
+fn build_status_json_report(
     root: &Path,
     groups: Vec<String>,
     all_groups: bool,
-) -> Result<CommandReport> {
+) -> Result<StatusJsonReport> {
     let manifest_path = manifest_path(root);
     let lock_path = lockfile_path(root);
     let manifest = load_manifest_optional(root)?;
     let lock = load_lockfile_optional(root)?;
-    let mut lines = Vec::new();
-    let mut drift = false;
+    let mut messages = Vec::new();
 
     let Some(manifest) = manifest else {
-        lines.push("status summary: drift detected".to_string());
-        lines.push(format!("manifest: missing ({})", manifest_path.display()));
-        match lock {
-            Some(lock) => lines.push(format!(
-                "lockfile: {} (packages={})",
-                lock_path.display(),
-                lock.packages.len()
-            )),
-            None => lines.push(format!("lockfile: missing ({})", lock_path.display())),
-        }
-        return Ok(CommandReport {
-            output: format!("{}\n", lines.join("\n")),
-            exit_code: 2,
+        let groups = requested_groups_fallback(&groups, all_groups);
+        messages.push(format!("manifest: missing ({})", manifest_path.display()));
+        let lockfile = match lock {
+            Some(lock) => {
+                messages.push(format!(
+                    "lockfile: {} (packages={})",
+                    lock_path.display(),
+                    lock.packages.len()
+                ));
+                StatusJsonLockfile {
+                    exists: true,
+                    path: lock_path.display().to_string(),
+                    packages: Some(lock.packages.len()),
+                    dependency_graph: Some(lock.metadata.dependency_graph),
+                    group_metadata: Some(lock.metadata.group_metadata),
+                }
+            }
+            None => {
+                messages.push(format!("lockfile: missing ({})", lock_path.display()));
+                StatusJsonLockfile {
+                    exists: false,
+                    path: lock_path.display().to_string(),
+                    packages: None,
+                    dependency_graph: None,
+                    group_metadata: None,
+                }
+            }
+        };
+        return Ok(StatusJsonReport {
+            command: "status",
+            groups,
+            summary: StatusJsonSummary {
+                state: "drift",
+                exit_code: 2,
+            },
+            manifest: StatusJsonManifest {
+                exists: false,
+                path: manifest_path.display().to_string(),
+                roots: None,
+                named_groups: None,
+            },
+            lockfile,
+            checks: StatusJsonChecks {
+                project_metadata: "unavailable",
+                group_coverage: "unavailable",
+                resolution: "unavailable",
+                sync: StatusJsonSync {
+                    installed: None,
+                    missing: None,
+                    packages: None,
+                },
+            },
+            messages,
         });
     };
 
     let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let groups = active_groups.iter().cloned().collect::<Vec<_>>();
     let selected_specs = selected_manifest_specs(&manifest, &active_groups);
-    lines.push(format!(
+    messages.push(format!(
         "status: groups={}",
         format_active_groups(&active_groups)
     ));
-    lines.push(format!(
+    messages.push(format!(
         "manifest: {} (roots={}, named-groups={})",
         manifest_path.display(),
         selected_specs.len(),
@@ -3182,54 +3577,91 @@ fn build_status_report(
     ));
 
     let Some(lock) = lock else {
-        lines.push(format!("lockfile: missing ({})", lock_path.display()));
-        lines.push("resolution: lockfile missing; run `mineconda lock`".to_string());
-        lines.push("sync: unavailable until a lockfile exists".to_string());
-        return Ok(CommandReport {
-            output: format!("{}\n", lines.join("\n")),
-            exit_code: 2,
+        messages.push(format!("lockfile: missing ({})", lock_path.display()));
+        messages.push("resolution: lockfile missing; run `mineconda lock`".to_string());
+        messages.push("sync: unavailable until a lockfile exists".to_string());
+        return Ok(StatusJsonReport {
+            command: "status",
+            groups,
+            summary: StatusJsonSummary {
+                state: "drift",
+                exit_code: 2,
+            },
+            manifest: StatusJsonManifest {
+                exists: true,
+                path: manifest_path.display().to_string(),
+                roots: Some(selected_specs.len()),
+                named_groups: Some(manifest.groups.0.len()),
+            },
+            lockfile: StatusJsonLockfile {
+                exists: false,
+                path: lock_path.display().to_string(),
+                packages: None,
+                dependency_graph: None,
+                group_metadata: None,
+            },
+            checks: StatusJsonChecks {
+                project_metadata: "unavailable",
+                group_coverage: "unavailable",
+                resolution: "unavailable",
+                sync: StatusJsonSync {
+                    installed: None,
+                    missing: None,
+                    packages: None,
+                },
+            },
+            messages,
         });
     };
 
-    lines.push(format!(
+    let mut drift = false;
+    messages.push(format!(
         "lockfile: {} (packages={})",
         lock_path.display(),
         lock.packages.len()
     ));
 
-    if lock.metadata.minecraft != manifest.project.minecraft
+    let project_metadata = if lock.metadata.minecraft != manifest.project.minecraft
         || lock.metadata.loader.kind != manifest.project.loader.kind
         || lock.metadata.loader.version != manifest.project.loader.version
     {
         drift = true;
-        lines
+        messages
             .push("project metadata: stale (minecraft/loader does not match manifest)".to_string());
+        "stale"
     } else {
-        lines.push("project metadata: aligned".to_string());
-    }
+        messages.push("project metadata: aligned".to_string());
+        "aligned"
+    };
 
     let mut lock_usable_for_groups = true;
+    let mut resolution = "unavailable";
     if !lock.metadata.dependency_graph {
         drift = true;
         lock_usable_for_groups = false;
-        lines.push(
+        messages.push(
             "resolution: lockfile does not contain dependency graph data; rerun `mineconda lock`"
                 .to_string(),
         );
     }
 
-    if let Err(err) = ensure_lock_group_metadata(&manifest, &lock, &active_groups) {
-        drift = true;
-        lock_usable_for_groups = false;
-        lines.push(format!("group coverage: {err}"));
-    } else if let Err(err) = ensure_lock_covers_groups(&manifest, &lock, &active_groups) {
-        drift = true;
-        lock_usable_for_groups = false;
-        lines.push(format!("group coverage: {err}"));
-    } else {
-        lines.push("group coverage: ok".to_string());
-    }
+    let group_coverage =
+        if let Err(err) = ensure_lock_group_metadata(&manifest, &lock, &active_groups) {
+            drift = true;
+            lock_usable_for_groups = false;
+            messages.push(format!("group coverage: {err}"));
+            "stale"
+        } else if let Err(err) = ensure_lock_covers_groups(&manifest, &lock, &active_groups) {
+            drift = true;
+            lock_usable_for_groups = false;
+            messages.push(format!("group coverage: {err}"));
+            "stale"
+        } else {
+            messages.push("group coverage: ok".to_string());
+            "ok"
+        };
 
+    let sync;
     if lock_usable_for_groups {
         let output = resolve_lockfile(
             &manifest,
@@ -3241,7 +3673,8 @@ fn build_status_report(
         )?;
         let entries = compute_lock_diff_entries(Some(&lock), &output.lockfile);
         if entries.is_empty() {
-            lines.push(format!(
+            resolution = "up_to_date";
+            messages.push(format!(
                 "resolution: up-to-date (install={} remove={} unchanged={})",
                 output.plan.install.len(),
                 output.plan.remove.len(),
@@ -3249,7 +3682,8 @@ fn build_status_report(
             ));
         } else {
             drift = true;
-            lines.push(format!(
+            resolution = "stale";
+            messages.push(format!(
                 "resolution: stale (install={} remove={} unchanged={} changes={})",
                 output.plan.install.len(),
                 output.plan.remove.len(),
@@ -3268,33 +3702,71 @@ fn build_status_report(
         if missing > 0 {
             drift = true;
         }
-        lines.push(format!(
+        messages.push(format!(
             "sync: installed={} missing={} packages={}",
             installed,
             missing,
             filtered.packages.len()
         ));
+        sync = StatusJsonSync {
+            installed: Some(installed),
+            missing: Some(missing),
+            packages: Some(filtered.packages.len()),
+        };
     } else {
-        lines.push("sync: unavailable until the lockfile is regenerated".to_string());
+        messages.push("sync: unavailable until the lockfile is regenerated".to_string());
+        sync = StatusJsonSync {
+            installed: None,
+            missing: None,
+            packages: None,
+        };
     }
 
-    lines.insert(
-        0,
-        if drift {
-            "status summary: drift detected".to_string()
-        } else {
-            "status summary: clean".to_string()
+    Ok(StatusJsonReport {
+        command: "status",
+        groups,
+        summary: StatusJsonSummary {
+            state: if drift { "drift" } else { "clean" },
+            exit_code: if drift { 2 } else { 0 },
         },
-    );
-
-    Ok(CommandReport {
-        output: format!("{}\n", lines.join("\n")),
-        exit_code: if drift { 2 } else { 0 },
+        manifest: StatusJsonManifest {
+            exists: true,
+            path: manifest_path.display().to_string(),
+            roots: Some(selected_specs.len()),
+            named_groups: Some(manifest.groups.0.len()),
+        },
+        lockfile: StatusJsonLockfile {
+            exists: true,
+            path: lock_path.display().to_string(),
+            packages: Some(lock.packages.len()),
+            dependency_graph: Some(lock.metadata.dependency_graph),
+            group_metadata: Some(lock.metadata.group_metadata),
+        },
+        checks: StatusJsonChecks {
+            project_metadata,
+            group_coverage,
+            resolution,
+            sync,
+        },
+        messages,
     })
 }
 
-fn cmd_status(root: &Path, groups: Vec<String>, all_groups: bool) -> Result<()> {
-    emit_command_report(build_status_report(root, groups, all_groups)?)
+fn cmd_status(root: &Path, groups: Vec<String>, all_groups: bool, json: bool) -> Result<()> {
+    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    if json {
+        match build_status_json_report(root, groups, all_groups) {
+            Ok(report) => emit_json_report(&report, report.summary.exit_code),
+            Err(err) => emit_json_report(
+                &json_error_report("status", fallback_groups, format!("{err:#}"), 1),
+                1,
+            ),
+        }
+    } else {
+        emit_command_report(render_status_json_report(&build_status_json_report(
+            root, groups, all_groups,
+        )?))
+    }
 }
 
 fn cmd_cache(root: &Path, command: CacheCommands) -> Result<()> {
@@ -4771,14 +5243,15 @@ mod tests {
         write_lockfile, write_manifest,
     };
     use mineconda_resolver::{ResolveRequest, SearchResult, SearchSource, resolve_lockfile};
+    use serde_json::Value;
 
     use super::{
-        Cli, DoctorLevel, LockDiffKind, build_lock_diff_report, build_status_report,
+        Cli, DoctorLevel, LockDiffKind, build_lock_diff_json_report, build_status_json_report,
         collect_s3_doctor_findings, compute_lock_diff_entries, display_width,
         extract_curseforge_project_id, extract_modrinth_slug, lock_package_matches_request,
-        render_forward_dependency_forest, render_lock_diff_entry, render_reverse_dependency_tree,
-        render_why_report, resolve_java_for_run, resolve_search_install_target, truncate_visual,
-        wrap_visual,
+        render_forward_dependency_forest, render_lock_diff_entry, render_lock_diff_json_report,
+        render_reverse_dependency_tree, render_status_json_report, render_why_report,
+        resolve_java_for_run, resolve_search_install_target, truncate_visual, wrap_visual,
     };
 
     #[test]
@@ -5041,9 +5514,29 @@ mods = [
         assert!(matches!(
             cli.command,
             super::Commands::Lock {
-                command: Some(super::LockCommands::Diff),
+                command: Some(super::LockCommands::Diff { json: false }),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_json_flags_for_lock_diff_and_status() {
+        let cli = Cli::try_parse_from(["mineconda", "lock", "diff", "--json"])
+            .expect("lock diff json should parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Lock {
+                command: Some(super::LockCommands::Diff { json: true }),
+                ..
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["mineconda", "status", "--json"]).expect("status json parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Status { json: true, .. }
         ));
     }
 
@@ -5116,10 +5609,12 @@ mods = [
         lock.metadata.dependency_graph = false;
         write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
 
-        let report =
-            build_lock_diff_report(&project.path, false, Vec::new(), false).expect("report");
+        let report = build_lock_diff_json_report(&project.path, false, Vec::new(), false)
+            .expect("report")
+            .expect_err("expected metadata error");
+        assert_eq!(report.command, "lock-diff");
         assert_eq!(report.exit_code, 2);
-        assert!(report.output.contains("dependency graph data"));
+        assert!(report.error.contains("dependency graph data"));
     }
 
     #[test]
@@ -5152,13 +5647,18 @@ mods = [
         )
         .expect("installed package");
 
-        let report = build_status_report(&project.path, Vec::new(), false).expect("status report");
-        assert_eq!(report.exit_code, 0);
-        assert!(report.output.contains("status summary: clean"));
-        assert!(report.output.contains("resolution: up-to-date"));
+        let report =
+            build_status_json_report(&project.path, Vec::new(), false).expect("status report");
+        assert_eq!(report.summary.state, "clean");
+        assert_eq!(report.summary.exit_code, 0);
+        assert_eq!(report.checks.resolution, "up_to_date");
+        assert_eq!(report.checks.sync.installed, Some(1));
+        assert_eq!(report.checks.sync.missing, Some(0));
+        let text = render_status_json_report(&report);
+        assert!(text.output.contains("status summary: clean"));
+        assert!(text.output.contains("resolution: up-to-date"));
         assert!(
-            report
-                .output
+            text.output
                 .contains("sync: installed=1 missing=0 packages=1")
         );
     }
@@ -5174,10 +5674,129 @@ mods = [
         )]);
         write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
 
-        let report = build_status_report(&project.path, Vec::new(), false).expect("status report");
-        assert_eq!(report.exit_code, 2);
-        assert!(report.output.contains("lockfile: missing"));
-        assert!(report.output.contains("run `mineconda lock`"));
+        let report =
+            build_status_json_report(&project.path, Vec::new(), false).expect("status report");
+        assert_eq!(report.summary.state, "drift");
+        assert_eq!(report.summary.exit_code, 2);
+        assert!(!report.lockfile.exists);
+        assert_eq!(report.checks.resolution, "unavailable");
+        let text = render_status_json_report(&report);
+        assert!(text.output.contains("lockfile: missing"));
+        assert!(text.output.contains("run `mineconda lock`"));
+    }
+
+    #[test]
+    fn lock_diff_json_report_serializes_expected_shape() {
+        let report = super::LockDiffJsonReport {
+            command: "lock-diff",
+            groups: vec![DEFAULT_GROUP_NAME.to_string(), "client".to_string()],
+            summary: super::LockDiffJsonSummary {
+                install: 1,
+                remove: 0,
+                unchanged: 2,
+                changes: 1,
+            },
+            entries: vec![super::LockDiffJsonEntry {
+                kind: "add".to_string(),
+                id: "iris".to_string(),
+                source: "modrinth".to_string(),
+                current_version: None,
+                desired_version: Some("1.0.0".to_string()),
+                current_groups: Vec::new(),
+                desired_groups: vec![DEFAULT_GROUP_NAME.to_string(), "client".to_string()],
+                current_dependencies: Vec::new(),
+                desired_dependencies: Vec::new(),
+                current_artifact: None,
+                desired_artifact: Some("file=iris.jar".to_string()),
+            }],
+        };
+
+        let value: Value = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(value["command"], "lock-diff");
+        assert_eq!(value["groups"][0], "default");
+        assert_eq!(value["summary"]["changes"], 1);
+        assert_eq!(value["entries"][0]["kind"], "add");
+        assert_eq!(value["entries"][0]["source"], "modrinth");
+    }
+
+    #[test]
+    fn status_json_report_serializes_expected_shape() {
+        let report = super::StatusJsonReport {
+            command: "status",
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
+            summary: super::StatusJsonSummary {
+                state: "clean",
+                exit_code: 0,
+            },
+            manifest: super::StatusJsonManifest {
+                exists: true,
+                path: "/tmp/mineconda.toml".to_string(),
+                roots: Some(1),
+                named_groups: Some(0),
+            },
+            lockfile: super::StatusJsonLockfile {
+                exists: true,
+                path: "/tmp/mineconda.lock".to_string(),
+                packages: Some(1),
+                dependency_graph: Some(true),
+                group_metadata: Some(true),
+            },
+            checks: super::StatusJsonChecks {
+                project_metadata: "aligned",
+                group_coverage: "ok",
+                resolution: "up_to_date",
+                sync: super::StatusJsonSync {
+                    installed: Some(1),
+                    missing: Some(0),
+                    packages: Some(1),
+                },
+            },
+            messages: vec!["status: groups=default".to_string()],
+        };
+
+        let value: Value = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(value["command"], "status");
+        assert_eq!(value["summary"]["state"], "clean");
+        assert_eq!(value["manifest"]["exists"], true);
+        assert_eq!(value["lockfile"]["dependency_graph"], true);
+        assert_eq!(value["checks"]["resolution"], "up_to_date");
+        assert_eq!(value["checks"]["sync"]["installed"], 1);
+    }
+
+    #[test]
+    fn lock_diff_text_report_renders_from_json_report() {
+        let report = super::LockDiffJsonReport {
+            command: "lock-diff",
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
+            summary: super::LockDiffJsonSummary {
+                install: 1,
+                remove: 0,
+                unchanged: 0,
+                changes: 1,
+            },
+            entries: vec![super::LockDiffJsonEntry {
+                kind: "add".to_string(),
+                id: "iris".to_string(),
+                source: "modrinth".to_string(),
+                current_version: None,
+                desired_version: Some("1.0.0".to_string()),
+                current_groups: Vec::new(),
+                desired_groups: vec![DEFAULT_GROUP_NAME.to_string()],
+                current_dependencies: Vec::new(),
+                desired_dependencies: Vec::new(),
+                current_artifact: None,
+                desired_artifact: Some("file=iris.jar".to_string()),
+            }],
+        };
+
+        let rendered = render_lock_diff_json_report(&report);
+        assert_eq!(rendered.exit_code, 2);
+        assert!(rendered.output.contains("lock diff: groups=default"));
+        assert!(
+            rendered
+                .output
+                .contains("ADD iris [modrinth] -> 1.0.0 groups=default")
+        );
     }
 
     #[test]

@@ -1105,6 +1105,7 @@ dependencies = [
  "mineconda-sync",
  "ratatui",
  "reqwest",
+ "serde",
  "serde_json",
  "terminal_size",
  "toml",

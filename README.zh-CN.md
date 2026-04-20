@@ -85,6 +85,7 @@ mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 
 - `mineconda lock diff`：只预览锁文件变化，不写回
 - `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
+- 两个命令都支持 `--json`，可用于脚本集成，并保持稳定的 `0/2/1` 退出码
 
 ## Dependency Groups
 

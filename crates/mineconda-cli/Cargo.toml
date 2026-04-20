@@ -17,6 +17,7 @@ terminal_size.workspace = true
 unicode-width.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 mineconda-core = { path = "../mineconda-core" }
