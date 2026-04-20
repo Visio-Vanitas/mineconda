@@ -23,7 +23,7 @@
 - `init`、`add`、`remove`、`ls`
 - `search`（交互式 / 非交互式，支持从结果直接安装）
 - `group`、`tree`、`why`
-- `lock`、`sync`、`cache`、`doctor`
+- `lock`、`status`、`sync`、`cache`、`doctor`
 - `env`、`run`、`import`、`export`
 
 当前稳定基线：
@@ -76,10 +76,15 @@ mineconda [--root <PATH>] [--no-color] [--lang <auto|en|zh-cn>] <COMMAND>
 
 - `init` / `add` / `remove` / `ls`
 - `group` / `tree` / `why`
-- `search` / `update` / `pin` / `lock`
+- `search` / `update` / `pin` / `lock` / `status`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
 - `import` / `export`
+
+适合查看包状态的命令：
+
+- `mineconda lock diff`：只预览锁文件变化，不写回
+- `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
 
 ## Dependency Groups
 

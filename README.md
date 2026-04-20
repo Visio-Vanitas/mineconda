@@ -23,7 +23,7 @@ The project is actively evolving. Core workflows are already usable:
 - `init`, `add`, `remove`, `ls`
 - `search` (interactive/non-interactive, install from results)
 - `group`, `tree`, `why`
-- `lock`, `sync`, `cache`, `doctor`
+- `lock`, `status`, `sync`, `cache`, `doctor`
 - `env`, `run`, `import`, `export`
 
 Stable baseline today:
@@ -76,10 +76,15 @@ Main commands:
 
 - `init` / `add` / `remove` / `ls`
 - `group` / `tree` / `why`
-- `search` / `update` / `pin` / `lock`
+- `search` / `update` / `pin` / `lock` / `status`
 - `sync` / `cache` / `doctor`
 - `env` / `run`
 - `import` / `export`
+
+Useful package-state commands:
+
+- `mineconda lock diff` previews lockfile changes without writing them
+- `mineconda status` reports manifest/lock/sync drift for the selected groups
 
 ## Dependency Groups
 

@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -11,10 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mineconda_core::{
-    DEFAULT_GROUP_NAME, JavaProvider, LoaderKind, LockedDependencyKind, LockedPackage, Lockfile,
-    Manifest, ModSide, ModSource, ModSpec, RuntimeProfile, S3CacheAuth, S3CacheConfig,
-    S3SourceConfig, ServerProfile, is_default_group_name, is_valid_group_name, lockfile_path,
-    manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
+    DEFAULT_GROUP_NAME, JavaProvider, LoaderKind, LockedDependency, LockedDependencyKind,
+    LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec, RuntimeProfile, S3CacheAuth,
+    S3CacheConfig, S3SourceConfig, ServerProfile, is_default_group_name, is_valid_group_name,
+    lockfile_path, manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
 };
 use mineconda_export::{
     ExportFormat, ExportRequest, ImportFormat as PackImportFormat, ImportRequest, ImportSide,
@@ -173,8 +174,16 @@ enum Commands {
         no_lock: bool,
     },
     Lock {
+        #[command(subcommand)]
+        command: Option<LockCommands>,
         #[arg(long)]
         upgrade: bool,
+        #[arg(long = "group")]
+        groups: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
+    },
+    Status {
         #[arg(long = "group")]
         groups: Vec<String>,
         #[arg(long)]
@@ -286,6 +295,11 @@ enum GroupCommands {
         #[arg(long)]
         no_lock: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LockCommands {
+    Diff,
 }
 
 #[derive(Subcommand, Debug)]
@@ -543,6 +557,54 @@ struct SyncCommandArgs {
     all_groups: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LockDiffKind {
+    Add,
+    Remove,
+    Upgrade,
+    Downgrade,
+    ChangeVersion,
+    ChangeArtifact,
+    ChangeGroups,
+    ChangeDependencies,
+}
+
+impl LockDiffKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "ADD",
+            Self::Remove => "REMOVE",
+            Self::Upgrade => "UPGRADE",
+            Self::Downgrade => "DOWNGRADE",
+            Self::ChangeVersion => "CHANGE VERSION",
+            Self::ChangeArtifact => "CHANGE ARTIFACT",
+            Self::ChangeGroups => "CHANGE GROUPS",
+            Self::ChangeDependencies => "CHANGE DEPENDENCIES",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LockDiffEntry {
+    kind: LockDiffKind,
+    id: String,
+    source: ModSource,
+    current_version: Option<String>,
+    desired_version: Option<String>,
+    current_groups: Vec<String>,
+    desired_groups: Vec<String>,
+    current_dependencies: Vec<LockedDependency>,
+    desired_dependencies: Vec<LockedDependency>,
+    current_artifact: Option<String>,
+    desired_artifact: Option<String>,
+}
+
+#[derive(Debug)]
+struct CommandReport {
+    output: String,
+    exit_code: i32,
+}
+
 fn normalize_group_selector(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -698,6 +760,296 @@ fn filtered_manifest_for_export(manifest: &Manifest, groups: &BTreeSet<String>) 
     filtered
 }
 
+fn format_group_list(groups: &[String]) -> String {
+    if groups.is_empty() {
+        return DEFAULT_GROUP_NAME.to_string();
+    }
+    groups.join(",")
+}
+
+fn format_active_groups(groups: &BTreeSet<String>) -> String {
+    format_group_list(&groups.iter().cloned().collect::<Vec<_>>())
+}
+
+fn normalized_package_groups(package: &LockedPackage) -> Vec<String> {
+    let mut groups = if package.groups.is_empty() {
+        vec![DEFAULT_GROUP_NAME.to_string()]
+    } else {
+        package.groups.clone()
+    };
+    groups.sort_by(|left, right| {
+        match (
+            is_default_group_name(left.as_str()),
+            is_default_group_name(right.as_str()),
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.cmp(right),
+        }
+    });
+    groups.dedup();
+    groups
+}
+
+fn normalized_package_dependencies(package: &LockedPackage) -> Vec<LockedDependency> {
+    let mut dependencies = package.dependencies.clone();
+    dependencies.sort_by(|left, right| {
+        (
+            left.id.as_str(),
+            left.source.as_str(),
+            left.kind.as_str(),
+            left.constraint.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                right.id.as_str(),
+                right.source.as_str(),
+                right.kind.as_str(),
+                right.constraint.as_deref().unwrap_or(""),
+            ))
+    });
+    dependencies
+}
+
+fn package_artifact_signature(package: &LockedPackage) -> String {
+    format!(
+        "file={} install={} url={}",
+        package.file_name,
+        package.install_path_or_default(),
+        package.download_url
+    )
+}
+
+fn dependency_signature(dependency: &LockedDependency) -> String {
+    let mut value = format!(
+        "{} [{}] ({})",
+        dependency.id,
+        dependency.source.as_str(),
+        dependency.kind.as_str()
+    );
+    if let Some(constraint) = dependency.constraint.as_deref() {
+        value.push_str(&format!(" {constraint}"));
+    }
+    value
+}
+
+fn format_dependency_list(dependencies: &[LockedDependency]) -> String {
+    if dependencies.is_empty() {
+        return "-".to_string();
+    }
+    dependencies
+        .iter()
+        .map(dependency_signature)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn version_number_tokens(raw: &str) -> Vec<u64> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+
+    for ch in raw.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u64>() {
+                values.push(value);
+            }
+            current.clear();
+        }
+    }
+
+    values
+}
+
+fn compare_version_change(current: &str, desired: &str) -> LockDiffKind {
+    let current_tokens = version_number_tokens(current);
+    let desired_tokens = version_number_tokens(desired);
+
+    if !current_tokens.is_empty() && !desired_tokens.is_empty() {
+        match current_tokens.cmp(&desired_tokens) {
+            std::cmp::Ordering::Less => return LockDiffKind::Upgrade,
+            std::cmp::Ordering::Greater => return LockDiffKind::Downgrade,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    LockDiffKind::ChangeVersion
+}
+
+fn compute_lock_diff_entries(current: Option<&Lockfile>, desired: &Lockfile) -> Vec<LockDiffEntry> {
+    let mut entries = Vec::new();
+    let current_by_key: HashMap<String, &LockedPackage> = current
+        .map(|lock| {
+            lock.packages
+                .iter()
+                .map(|package| (locked_package_graph_key(package), package))
+                .collect()
+        })
+        .unwrap_or_default();
+    let desired_by_key: HashMap<String, &LockedPackage> = desired
+        .packages
+        .iter()
+        .map(|package| (locked_package_graph_key(package), package))
+        .collect();
+
+    for package in &desired.packages {
+        let key = locked_package_graph_key(package);
+        let desired_groups = normalized_package_groups(package);
+        let desired_dependencies = normalized_package_dependencies(package);
+        match current_by_key.get(&key) {
+            None => entries.push(LockDiffEntry {
+                kind: LockDiffKind::Add,
+                id: package.id.clone(),
+                source: package.source,
+                current_version: None,
+                desired_version: Some(package.version.clone()),
+                current_groups: Vec::new(),
+                desired_groups,
+                current_dependencies: Vec::new(),
+                desired_dependencies,
+                current_artifact: None,
+                desired_artifact: Some(package_artifact_signature(package)),
+            }),
+            Some(existing) => {
+                let current_groups = normalized_package_groups(existing);
+                let current_dependencies = normalized_package_dependencies(existing);
+                if existing.version != package.version {
+                    entries.push(LockDiffEntry {
+                        kind: compare_version_change(&existing.version, &package.version),
+                        id: package.id.clone(),
+                        source: package.source,
+                        current_version: Some(existing.version.clone()),
+                        desired_version: Some(package.version.clone()),
+                        current_groups: current_groups.clone(),
+                        desired_groups: desired_groups.clone(),
+                        current_dependencies: current_dependencies.clone(),
+                        desired_dependencies: desired_dependencies.clone(),
+                        current_artifact: Some(package_artifact_signature(existing)),
+                        desired_artifact: Some(package_artifact_signature(package)),
+                    });
+                } else if package_artifact_signature(existing)
+                    != package_artifact_signature(package)
+                {
+                    entries.push(LockDiffEntry {
+                        kind: LockDiffKind::ChangeArtifact,
+                        id: package.id.clone(),
+                        source: package.source,
+                        current_version: Some(existing.version.clone()),
+                        desired_version: Some(package.version.clone()),
+                        current_groups: current_groups.clone(),
+                        desired_groups: desired_groups.clone(),
+                        current_dependencies: current_dependencies.clone(),
+                        desired_dependencies: desired_dependencies.clone(),
+                        current_artifact: Some(package_artifact_signature(existing)),
+                        desired_artifact: Some(package_artifact_signature(package)),
+                    });
+                }
+
+                if current_groups != desired_groups {
+                    entries.push(LockDiffEntry {
+                        kind: LockDiffKind::ChangeGroups,
+                        id: package.id.clone(),
+                        source: package.source,
+                        current_version: Some(existing.version.clone()),
+                        desired_version: Some(package.version.clone()),
+                        current_groups,
+                        desired_groups,
+                        current_dependencies: current_dependencies.clone(),
+                        desired_dependencies: desired_dependencies.clone(),
+                        current_artifact: None,
+                        desired_artifact: None,
+                    });
+                }
+
+                if current_dependencies != desired_dependencies {
+                    entries.push(LockDiffEntry {
+                        kind: LockDiffKind::ChangeDependencies,
+                        id: package.id.clone(),
+                        source: package.source,
+                        current_version: Some(existing.version.clone()),
+                        desired_version: Some(package.version.clone()),
+                        current_groups: normalized_package_groups(existing),
+                        desired_groups: normalized_package_groups(package),
+                        current_dependencies,
+                        desired_dependencies,
+                        current_artifact: None,
+                        desired_artifact: None,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(current) = current {
+        for package in &current.packages {
+            let key = locked_package_graph_key(package);
+            if desired_by_key.contains_key(&key) {
+                continue;
+            }
+            entries.push(LockDiffEntry {
+                kind: LockDiffKind::Remove,
+                id: package.id.clone(),
+                source: package.source,
+                current_version: Some(package.version.clone()),
+                desired_version: None,
+                current_groups: normalized_package_groups(package),
+                desired_groups: Vec::new(),
+                current_dependencies: normalized_package_dependencies(package),
+                desired_dependencies: Vec::new(),
+                current_artifact: Some(package_artifact_signature(package)),
+                desired_artifact: None,
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        (lock_graph_key(left.source, &left.id), left.kind)
+            .cmp(&(lock_graph_key(right.source, &right.id), right.kind))
+    });
+    entries
+}
+
+fn render_lock_diff_entry(entry: &LockDiffEntry) -> String {
+    let prefix = format!(
+        "{} {} [{}]",
+        entry.kind.label(),
+        entry.id,
+        entry.source.as_str()
+    );
+    match entry.kind {
+        LockDiffKind::Add => format!(
+            "{prefix} -> {} groups={}",
+            entry.desired_version.as_deref().unwrap_or("-"),
+            format_group_list(&entry.desired_groups)
+        ),
+        LockDiffKind::Remove => format!(
+            "{prefix} <- {} groups={}",
+            entry.current_version.as_deref().unwrap_or("-"),
+            format_group_list(&entry.current_groups)
+        ),
+        LockDiffKind::Upgrade | LockDiffKind::Downgrade | LockDiffKind::ChangeVersion => format!(
+            "{prefix} {} -> {}",
+            entry.current_version.as_deref().unwrap_or("-"),
+            entry.desired_version.as_deref().unwrap_or("-")
+        ),
+        LockDiffKind::ChangeArtifact => format!(
+            "{prefix} {} -> {}",
+            entry.current_artifact.as_deref().unwrap_or("-"),
+            entry.desired_artifact.as_deref().unwrap_or("-")
+        ),
+        LockDiffKind::ChangeGroups => format!(
+            "{prefix} {} -> {}",
+            format_group_list(&entry.current_groups),
+            format_group_list(&entry.desired_groups)
+        ),
+        LockDiffKind::ChangeDependencies => format!(
+            "{prefix} {} -> {}",
+            format_dependency_list(&entry.current_dependencies),
+            format_dependency_list(&entry.desired_dependencies)
+        ),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root;
@@ -788,10 +1140,15 @@ fn main() -> Result<()> {
             no_lock,
         } => cmd_pin(&root, id, source, version, groups, all_groups, no_lock)?,
         Commands::Lock {
+            command,
             upgrade,
             groups,
             all_groups,
-        } => cmd_lock(&root, upgrade, groups, all_groups)?,
+        } => match command {
+            Some(LockCommands::Diff) => cmd_lock_diff(&root, upgrade, groups, all_groups)?,
+            None => cmd_lock(&root, upgrade, groups, all_groups)?,
+        },
+        Commands::Status { groups, all_groups } => cmd_status(&root, groups, all_groups)?,
         Commands::Cache { command } => cmd_cache(&root, command)?,
         Commands::Env { command } => cmd_env(&root, command)?,
         Commands::Sync {
@@ -2706,6 +3063,240 @@ fn cmd_lock(root: &Path, upgrade: bool, groups: Vec<String>, all_groups: bool) -
     )
 }
 
+fn emit_command_report(report: CommandReport) -> Result<()> {
+    print!("{}", report.output);
+    if !report.output.ends_with('\n') {
+        println!();
+    }
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+    if report.exit_code != 0 {
+        process::exit(report.exit_code);
+    }
+    Ok(())
+}
+
+fn build_lock_diff_report(
+    root: &Path,
+    upgrade: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+) -> Result<CommandReport> {
+    let manifest = load_manifest(root)?;
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let current = load_lockfile_optional(root)?;
+
+    if let Some(lock) = current.as_ref() {
+        if !lock.metadata.dependency_graph {
+            return Ok(CommandReport {
+                output: "lock diff: lockfile does not contain dependency graph data; rerun `mineconda lock` first\n".to_string(),
+                exit_code: 2,
+            });
+        }
+        if let Err(err) = ensure_lock_group_metadata(&manifest, lock, &active_groups) {
+            return Ok(CommandReport {
+                output: format!("lock diff: {err}\n"),
+                exit_code: 2,
+            });
+        }
+    }
+
+    let output = resolve_lockfile(
+        &manifest,
+        current.as_ref(),
+        &ResolveRequest {
+            upgrade,
+            groups: active_groups.clone(),
+        },
+    )?;
+    let entries = compute_lock_diff_entries(current.as_ref(), &output.lockfile);
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "lock diff: groups={} install={} remove={} unchanged={} changes={}",
+        format_active_groups(&active_groups),
+        output.plan.install.len(),
+        output.plan.remove.len(),
+        output.plan.unchanged.len(),
+        entries.len()
+    ));
+    if entries.is_empty() {
+        lines.push("lock diff: no changes".to_string());
+        return Ok(CommandReport {
+            output: format!("{}\n", lines.join("\n")),
+            exit_code: 0,
+        });
+    }
+
+    lines.extend(entries.iter().map(render_lock_diff_entry));
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 2,
+    })
+}
+
+fn cmd_lock_diff(root: &Path, upgrade: bool, groups: Vec<String>, all_groups: bool) -> Result<()> {
+    emit_command_report(build_lock_diff_report(root, upgrade, groups, all_groups)?)
+}
+
+fn build_status_report(
+    root: &Path,
+    groups: Vec<String>,
+    all_groups: bool,
+) -> Result<CommandReport> {
+    let manifest_path = manifest_path(root);
+    let lock_path = lockfile_path(root);
+    let manifest = load_manifest_optional(root)?;
+    let lock = load_lockfile_optional(root)?;
+    let mut lines = Vec::new();
+    let mut drift = false;
+
+    let Some(manifest) = manifest else {
+        lines.push("status summary: drift detected".to_string());
+        lines.push(format!("manifest: missing ({})", manifest_path.display()));
+        match lock {
+            Some(lock) => lines.push(format!(
+                "lockfile: {} (packages={})",
+                lock_path.display(),
+                lock.packages.len()
+            )),
+            None => lines.push(format!("lockfile: missing ({})", lock_path.display())),
+        }
+        return Ok(CommandReport {
+            output: format!("{}\n", lines.join("\n")),
+            exit_code: 2,
+        });
+    };
+
+    let active_groups = activation_groups(&manifest, &groups, all_groups)?;
+    let selected_specs = selected_manifest_specs(&manifest, &active_groups);
+    lines.push(format!(
+        "status: groups={}",
+        format_active_groups(&active_groups)
+    ));
+    lines.push(format!(
+        "manifest: {} (roots={}, named-groups={})",
+        manifest_path.display(),
+        selected_specs.len(),
+        manifest.groups.0.len()
+    ));
+
+    let Some(lock) = lock else {
+        lines.push(format!("lockfile: missing ({})", lock_path.display()));
+        lines.push("resolution: lockfile missing; run `mineconda lock`".to_string());
+        lines.push("sync: unavailable until a lockfile exists".to_string());
+        return Ok(CommandReport {
+            output: format!("{}\n", lines.join("\n")),
+            exit_code: 2,
+        });
+    };
+
+    lines.push(format!(
+        "lockfile: {} (packages={})",
+        lock_path.display(),
+        lock.packages.len()
+    ));
+
+    if lock.metadata.minecraft != manifest.project.minecraft
+        || lock.metadata.loader.kind != manifest.project.loader.kind
+        || lock.metadata.loader.version != manifest.project.loader.version
+    {
+        drift = true;
+        lines
+            .push("project metadata: stale (minecraft/loader does not match manifest)".to_string());
+    } else {
+        lines.push("project metadata: aligned".to_string());
+    }
+
+    let mut lock_usable_for_groups = true;
+    if !lock.metadata.dependency_graph {
+        drift = true;
+        lock_usable_for_groups = false;
+        lines.push(
+            "resolution: lockfile does not contain dependency graph data; rerun `mineconda lock`"
+                .to_string(),
+        );
+    }
+
+    if let Err(err) = ensure_lock_group_metadata(&manifest, &lock, &active_groups) {
+        drift = true;
+        lock_usable_for_groups = false;
+        lines.push(format!("group coverage: {err}"));
+    } else if let Err(err) = ensure_lock_covers_groups(&manifest, &lock, &active_groups) {
+        drift = true;
+        lock_usable_for_groups = false;
+        lines.push(format!("group coverage: {err}"));
+    } else {
+        lines.push("group coverage: ok".to_string());
+    }
+
+    if lock_usable_for_groups {
+        let output = resolve_lockfile(
+            &manifest,
+            Some(&lock),
+            &ResolveRequest {
+                upgrade: false,
+                groups: active_groups.clone(),
+            },
+        )?;
+        let entries = compute_lock_diff_entries(Some(&lock), &output.lockfile);
+        if entries.is_empty() {
+            lines.push(format!(
+                "resolution: up-to-date (install={} remove={} unchanged={})",
+                output.plan.install.len(),
+                output.plan.remove.len(),
+                output.plan.unchanged.len()
+            ));
+        } else {
+            drift = true;
+            lines.push(format!(
+                "resolution: stale (install={} remove={} unchanged={} changes={})",
+                output.plan.install.len(),
+                output.plan.remove.len(),
+                output.plan.unchanged.len(),
+                entries.len()
+            ));
+        }
+
+        let filtered = filtered_lockfile(&lock, &active_groups);
+        let installed = filtered
+            .packages
+            .iter()
+            .filter(|package| package_install_target_path(root, package).exists())
+            .count();
+        let missing = filtered.packages.len().saturating_sub(installed);
+        if missing > 0 {
+            drift = true;
+        }
+        lines.push(format!(
+            "sync: installed={} missing={} packages={}",
+            installed,
+            missing,
+            filtered.packages.len()
+        ));
+    } else {
+        lines.push("sync: unavailable until the lockfile is regenerated".to_string());
+    }
+
+    lines.insert(
+        0,
+        if drift {
+            "status summary: drift detected".to_string()
+        } else {
+            "status summary: clean".to_string()
+        },
+    );
+
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: if drift { 2 } else { 0 },
+    })
+}
+
+fn cmd_status(root: &Path, groups: Vec<String>, all_groups: bool) -> Result<()> {
+    emit_command_report(build_status_report(root, groups, all_groups)?)
+}
+
 fn cmd_cache(root: &Path, command: CacheCommands) -> Result<()> {
     match command {
         CacheCommands::Dir => {
@@ -4168,19 +4759,26 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use clap::Parser;
     use mineconda_core::{
         DEFAULT_GROUP_NAME, LoaderKind, LoaderSpec, LockMetadata, LockedDependency,
         LockedDependencyKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
-        ProjectSection, RuntimeProfile, ServerProfile,
+        ProjectSection, RuntimeProfile, ServerProfile, lockfile_path, manifest_path,
+        write_lockfile, write_manifest,
     };
-    use mineconda_resolver::{SearchResult, SearchSource};
+    use mineconda_resolver::{ResolveRequest, SearchResult, SearchSource, resolve_lockfile};
 
     use super::{
-        DoctorLevel, collect_s3_doctor_findings, display_width, extract_curseforge_project_id,
-        extract_modrinth_slug, lock_package_matches_request, render_forward_dependency_forest,
-        render_reverse_dependency_tree, render_why_report, resolve_java_for_run,
-        resolve_search_install_target, truncate_visual, wrap_visual,
+        Cli, DoctorLevel, LockDiffKind, build_lock_diff_report, build_status_report,
+        collect_s3_doctor_findings, compute_lock_diff_entries, display_width,
+        extract_curseforge_project_id, extract_modrinth_slug, lock_package_matches_request,
+        render_forward_dependency_forest, render_lock_diff_entry, render_reverse_dependency_tree,
+        render_why_report, resolve_java_for_run, resolve_search_install_target, truncate_visual,
+        wrap_visual,
     };
 
     #[test]
@@ -4412,6 +5010,174 @@ mods = [
             groups: vec![DEFAULT_GROUP_NAME.to_string()],
             dependencies,
         }
+    }
+
+    struct TempProject {
+        path: PathBuf,
+    }
+
+    impl TempProject {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("mineconda-{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("temp project directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn cli_parses_lock_diff_subcommand() {
+        let cli = Cli::try_parse_from(["mineconda", "lock", "diff"]).expect("cli should parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Lock {
+                command: Some(super::LockCommands::Diff),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lock_diff_entries_capture_upgrade_group_and_dependency_changes() {
+        let mut current = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
+        current.groups = vec![DEFAULT_GROUP_NAME.to_string()];
+
+        let mut desired = test_package("alpha", "2.0.0", vec![required_dependency("gamma")]);
+        desired.groups = vec![DEFAULT_GROUP_NAME.to_string(), "client".to_string()];
+
+        let entries = compute_lock_diff_entries(
+            Some(&test_lockfile(vec![current])),
+            &test_lockfile(vec![desired]),
+        );
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == LockDiffKind::Upgrade)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == LockDiffKind::ChangeGroups)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == LockDiffKind::ChangeDependencies)
+        );
+    }
+
+    #[test]
+    fn render_lock_diff_entry_formats_group_changes() {
+        let line = render_lock_diff_entry(&super::LockDiffEntry {
+            kind: LockDiffKind::ChangeGroups,
+            id: "iris".to_string(),
+            source: ModSource::Modrinth,
+            current_version: Some("1.0.0".to_string()),
+            desired_version: Some("1.0.0".to_string()),
+            current_groups: vec![DEFAULT_GROUP_NAME.to_string()],
+            desired_groups: vec![DEFAULT_GROUP_NAME.to_string(), "client".to_string()],
+            current_dependencies: Vec::new(),
+            desired_dependencies: Vec::new(),
+            current_artifact: None,
+            desired_artifact: None,
+        });
+
+        assert_eq!(
+            line,
+            "CHANGE GROUPS iris [modrinth] default -> default,client"
+        );
+    }
+
+    #[test]
+    fn lock_diff_report_requires_dependency_graph_metadata() {
+        let project = TempProject::new("lock-diff-metadata");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+
+        let mut lock = test_lockfile(vec![LockedPackage::placeholder(&manifest.mods[0])]);
+        lock.metadata.dependency_graph = false;
+        write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
+
+        let report =
+            build_lock_diff_report(&project.path, false, Vec::new(), false).expect("report");
+        assert_eq!(report.exit_code, 2);
+        assert!(report.output.contains("dependency graph data"));
+    }
+
+    #[test]
+    fn status_report_is_clean_for_synced_local_project() {
+        let project = TempProject::new("status-clean");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::new(),
+            },
+        )
+        .expect("resolve local lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+        fs::create_dir_all(project.path.join("mods")).expect("mods dir");
+        let package = output.lockfile.packages.first().expect("locked package");
+        fs::write(
+            project.path.join(package.install_path_or_default()),
+            b"installed",
+        )
+        .expect("installed package");
+
+        let report = build_status_report(&project.path, Vec::new(), false).expect("status report");
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("status summary: clean"));
+        assert!(report.output.contains("resolution: up-to-date"));
+        assert!(
+            report
+                .output
+                .contains("sync: installed=1 missing=0 packages=1")
+        );
+    }
+
+    #[test]
+    fn status_report_marks_missing_lock_as_drift() {
+        let project = TempProject::new("status-missing-lock");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+
+        let report = build_status_report(&project.path, Vec::new(), false).expect("status report");
+        assert_eq!(report.exit_code, 2);
+        assert!(report.output.contains("lockfile: missing"));
+        assert!(report.output.contains("run `mineconda lock`"));
     }
 
     #[test]
