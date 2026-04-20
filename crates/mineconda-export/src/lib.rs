@@ -364,6 +364,7 @@ fn import_mrpack(request: &ImportRequest) -> Result<ImportResult> {
             download_url: first_download,
             hashes: lock_hashes,
             source_ref,
+            dependencies: Vec::new(),
         });
     }
 
@@ -1031,6 +1032,7 @@ mod tests {
                     },
                 ],
                 source_ref: Some("project=abc;version=v1".to_string()),
+                dependencies: Vec::new(),
             }],
         };
 
@@ -1072,6 +1074,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -1099,6 +1102,7 @@ mod tests {
                     value: "sha1v".to_string(),
                 }],
                 source_ref: None,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -1284,6 +1288,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -1321,6 +1326,7 @@ mod tests {
                     },
                 ],
                 source_ref: None,
+                dependencies: Vec::new(),
             }],
         };
 
@@ -1380,6 +1386,7 @@ mod tests {
                     download_url: "https://example.com/valid.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: Some("mod=325492;file=5940240".to_string()),
+                    dependencies: Vec::new(),
                 },
                 LockedPackage {
                     id: "invalid".to_string(),
@@ -1393,6 +1400,7 @@ mod tests {
                     download_url: "https://example.com/invalid.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: Some("mod=348521;file=6150677".to_string()),
+                    dependencies: Vec::new(),
                 },
                 LockedPackage {
                     id: "modrinth".to_string(),
@@ -1406,6 +1414,7 @@ mod tests {
                     download_url: "https://example.com/other.jar".to_string(),
                     hashes: Vec::new(),
                     source_ref: None,
+                    dependencies: Vec::new(),
                 },
             ],
         };
@@ -1454,6 +1463,7 @@ mod tests {
                 kind: LoaderKind::NeoForge,
                 version: "latest".to_string(),
             },
+            dependency_graph: true,
         }
     }
 

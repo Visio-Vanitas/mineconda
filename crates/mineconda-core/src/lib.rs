@@ -343,6 +343,7 @@ impl Lockfile {
                 generated_at_unix: unix_timestamp(),
                 minecraft: manifest.project.minecraft.clone(),
                 loader: manifest.project.loader.clone(),
+                dependency_graph: true,
             },
             packages,
         }
@@ -362,6 +363,35 @@ pub struct LockMetadata {
     pub generated_at_unix: u64,
     pub minecraft: String,
     pub loader: LoaderSpec,
+    #[serde(default)]
+    pub dependency_graph: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LockedDependencyKind {
+    #[default]
+    Required,
+    Incompatible,
+}
+
+impl LockedDependencyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Incompatible => "incompatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedDependency {
+    pub source: ModSource,
+    pub id: String,
+    #[serde(default)]
+    pub kind: LockedDependencyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +412,8 @@ pub struct LockedPackage {
     pub hashes: Vec<PackageHash>,
     #[serde(default)]
     pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<LockedDependency>,
 }
 
 impl LockedPackage {
@@ -398,6 +430,7 @@ impl LockedPackage {
             download_url: "pending".to_string(),
             hashes: Vec::new(),
             source_ref: None,
+            dependencies: Vec::new(),
         }
     }
 
@@ -567,7 +600,7 @@ fn sanitize_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, REPOSITORY_URL, S3CacheAuth, http_user_agent};
+    use super::{Lockfile, Manifest, REPOSITORY_URL, S3CacheAuth, http_user_agent};
 
     #[test]
     fn s3_cache_auth_defaults_to_auto() {
@@ -645,5 +678,33 @@ upload_enabled = false
         let value = http_user_agent();
         assert!(value.starts_with("mineconda/"));
         assert!(value.contains(REPOSITORY_URL));
+    }
+
+    #[test]
+    fn lockfile_dependency_graph_defaults_to_false_for_older_files() {
+        let lock: Lockfile = toml::from_str(
+            r#"
+[metadata]
+generated_by = "mineconda/0.1.0"
+generated_at_unix = 0
+minecraft = "1.21.1"
+
+[metadata.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[packages]]
+id = "demo"
+source = "local"
+version = "vendor/demo.jar"
+side = "both"
+file_name = "demo.jar"
+sha256 = "pending"
+download_url = "vendor/demo.jar"
+"#,
+        )
+        .expect("lockfile should parse");
+        assert!(!lock.metadata.dependency_graph);
+        assert!(lock.packages[0].dependencies.is_empty());
     }
 }

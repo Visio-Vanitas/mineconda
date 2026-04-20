@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mineconda_core::{
-    HashAlgorithm, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, PackageHash,
-    S3SourceConfig, http_user_agent,
+    HashAlgorithm, LoaderKind, LockedDependency, LockedDependencyKind, LockedPackage, Lockfile,
+    Manifest, ModSide, ModSource, PackageHash, S3SourceConfig, http_user_agent,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -76,6 +76,30 @@ struct DependencyEdge {
     constraint: VersionConstraint,
     kind: DependencyKind,
     requested_by: String,
+}
+
+fn manifest_request_chain(source: ModSource, id: &str) -> String {
+    format!("manifest -> {id} [{}]", source.as_str())
+}
+
+fn extend_request_chain(chain: &str, source: ModSource, id: &str, version: &str) -> String {
+    format!("{chain} -> {id} [{}]@{version}", source.as_str())
+}
+
+fn locked_dependency_from_edge(edge: &DependencyEdge) -> LockedDependency {
+    LockedDependency {
+        source: edge.source,
+        id: edge.id.clone(),
+        kind: match edge.kind {
+            DependencyKind::Required => LockedDependencyKind::Required,
+            DependencyKind::Incompatible => LockedDependencyKind::Incompatible,
+        },
+        constraint: if edge.constraint.is_any() {
+            None
+        } else {
+            Some(edge.constraint.describe())
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,7 +522,7 @@ fn resolve_locked_packages(manifest: &Manifest) -> Result<Vec<LockedPackage>> {
             constraint: VersionConstraint::from_raw(&mod_spec.version),
             install_path: mod_spec.install_path.clone(),
             side: mod_spec.side,
-            requested_by: "manifest".to_string(),
+            requested_by: manifest_request_chain(mod_spec.source, &mod_spec.id),
         };
 
         if let Err(conflict) =
@@ -837,6 +861,7 @@ fn resolve_modrinth_requirement(
             "requested={};project={};version={};name={}",
             requirement.id, package_id, version.id, version.name
         )),
+        dependencies: Vec::new(),
     };
 
     for (algorithm, value) in &file.hashes {
@@ -850,6 +875,12 @@ fn resolve_modrinth_requirement(
     package.normalize_hashes();
 
     let mut dependencies = Vec::new();
+    let request_chain = extend_request_chain(
+        &requirement.requested_by,
+        package.source,
+        &package.id,
+        &package.version,
+    );
     for dependency in &version.dependencies {
         let Some(project_id) = dependency.project_id.clone() else {
             continue;
@@ -865,18 +896,22 @@ fn resolve_modrinth_requirement(
                     .map(|id| VersionConstraint::exact(id.clone()))
                     .unwrap_or_else(VersionConstraint::any),
                 kind: DependencyKind::Required,
-                requested_by: format!("{}@{}", package.id, package.version),
+                requested_by: request_chain.clone(),
             }),
             "incompatible" => dependencies.push(DependencyEdge {
                 source: ModSource::Modrinth,
                 id: project_id,
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Incompatible,
-                requested_by: format!("{}@{}", package.id, package.version),
+                requested_by: request_chain.clone(),
             }),
             _ => {}
         }
     }
+    package.dependencies = dependencies
+        .iter()
+        .map(locked_dependency_from_edge)
+        .collect();
 
     Ok(ResolvedEntry {
         package,
@@ -998,6 +1033,7 @@ fn resolve_curseforge_requirement(
         download_url,
         hashes: Vec::new(),
         source_ref: Some(format!("mod={};file={}", mod_id, selected.id)),
+        dependencies: Vec::new(),
     };
 
     for hash in &selected.hashes {
@@ -1011,6 +1047,12 @@ fn resolve_curseforge_requirement(
     package.normalize_hashes();
 
     let mut dependencies = Vec::new();
+    let request_chain = extend_request_chain(
+        &requirement.requested_by,
+        package.source,
+        &package.id,
+        &package.version,
+    );
     for dependency in &selected.dependencies {
         match dependency.relation_type {
             3 => dependencies.push(DependencyEdge {
@@ -1018,18 +1060,22 @@ fn resolve_curseforge_requirement(
                 id: dependency.mod_id.to_string(),
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Required,
-                requested_by: format!("{}@{}", package.id, package.version),
+                requested_by: request_chain.clone(),
             }),
             5 => dependencies.push(DependencyEdge {
                 source: ModSource::Curseforge,
                 id: dependency.mod_id.to_string(),
                 constraint: VersionConstraint::any(),
                 kind: DependencyKind::Incompatible,
-                requested_by: format!("{}@{}", package.id, package.version),
+                requested_by: request_chain.clone(),
             }),
             _ => {}
         }
     }
+    package.dependencies = dependencies
+        .iter()
+        .map(locked_dependency_from_edge)
+        .collect();
 
     Ok(ResolvedEntry {
         package,
@@ -1101,6 +1147,7 @@ fn resolve_url_requirement(requirement: &ResolutionRequirement) -> Result<Resolv
             download_url: url.clone(),
             hashes: Vec::new(),
             source_ref: Some(url.clone()),
+            dependencies: Vec::new(),
         },
         resolved_version_id: Some(url.clone()),
         resolved_name: None,
@@ -1132,6 +1179,7 @@ fn resolve_local_requirement(requirement: &ResolutionRequirement) -> Result<Reso
             download_url: path.clone(),
             hashes: Vec::new(),
             source_ref: Some(path.clone()),
+            dependencies: Vec::new(),
         },
         resolved_version_id: Some(path.clone()),
         resolved_name: None,
@@ -1174,6 +1222,7 @@ fn resolve_s3_requirement(
             download_url,
             hashes: Vec::new(),
             source_ref: Some(format!("s3://{}/{}", config.bucket.trim(), key)),
+            dependencies: Vec::new(),
         },
         resolved_version_id: Some(key),
         resolved_name: None,
@@ -1372,7 +1421,7 @@ fn merge_side(left: ModSide, right: ModSide) -> ModSide {
 
 fn requirement_label(requirement: &ResolutionRequirement) -> String {
     format!(
-        "{}@{} ({})",
+        "{}@{} via {}",
         requirement.id,
         requirement.source.as_str(),
         requirement.requested_by
@@ -2782,6 +2831,7 @@ mod tests {
                 download_url: "https://example.com/sodium.jar".to_string(),
                 hashes: Vec::new(),
                 source_ref: None,
+                dependencies: Vec::new(),
             },
             resolved_version_id: Some("OihdIimA".to_string()),
             resolved_name: Some("Sodium".to_string()),

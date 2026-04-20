@@ -1527,6 +1527,7 @@ mod tests {
             download_url: "https://example.com/ferrite-core.jar".to_string(),
             hashes: Vec::new(),
             source_ref: None,
+            dependencies: Vec::new(),
         }
     }
 
@@ -1539,6 +1540,7 @@ mod tests {
                 kind: LoaderKind::NeoForge,
                 version: "latest".to_string(),
             },
+            dependency_graph: true,
         }
     }
 

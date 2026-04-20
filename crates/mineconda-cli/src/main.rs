@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Write};
@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mineconda_core::{
-    JavaProvider, LoaderKind, LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec,
-    RuntimeProfile, S3CacheAuth, S3CacheConfig, S3SourceConfig, ServerProfile, lockfile_path,
-    manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
+    JavaProvider, LoaderKind, LockedDependencyKind, LockedPackage, Lockfile, Manifest, ModSide,
+    ModSource, ModSpec, RuntimeProfile, S3CacheAuth, S3CacheConfig, S3SourceConfig, ServerProfile,
+    lockfile_path, manifest_path, read_lockfile, read_manifest, write_lockfile, write_manifest,
 };
 use mineconda_export::{
     ExportFormat, ExportRequest, ImportFormat as PackImportFormat, ImportRequest, ImportSide,
@@ -105,6 +105,20 @@ enum Commands {
         install_first: bool,
         #[arg(long)]
         install_version: Option<String>,
+    },
+    Tree {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        invert: Option<String>,
+        #[arg(long, conflicts_with_all = ["id", "invert"])]
+        all: bool,
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
+    },
+    Why {
+        id: String,
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
     },
     #[command(visible_alias = "upgrade")]
     Update {
@@ -501,6 +515,13 @@ fn main() -> Result<()> {
                 install_version,
             },
         )?,
+        Commands::Tree {
+            id,
+            invert,
+            all,
+            source,
+        } => cmd_tree(&root, id, invert, all, source)?,
+        Commands::Why { id, source } => cmd_why(&root, &id, source)?,
         Commands::Update {
             id,
             source,
@@ -1730,6 +1751,476 @@ fn paint(text: &str, code: &str, enabled: bool) -> String {
         return text.to_string();
     }
     format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+#[derive(Debug, Clone)]
+struct LockGraphEdge {
+    source: ModSource,
+    id: String,
+    kind: LockedDependencyKind,
+    constraint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReverseLockGraphEdge {
+    dependent_key: String,
+    kind: LockedDependencyKind,
+    constraint: Option<String>,
+}
+
+struct LockGraph<'a> {
+    packages_by_key: HashMap<String, &'a LockedPackage>,
+    forward_edges: HashMap<String, Vec<LockGraphEdge>>,
+    reverse_edges: HashMap<String, Vec<ReverseLockGraphEdge>>,
+}
+
+impl<'a> LockGraph<'a> {
+    fn from_lock(lock: &'a Lockfile) -> Self {
+        let mut packages_by_key = HashMap::new();
+        let mut forward_edges = HashMap::new();
+        let mut reverse_edges: HashMap<String, Vec<ReverseLockGraphEdge>> = HashMap::new();
+
+        for package in &lock.packages {
+            let key = lock_graph_key(package.source, &package.id);
+            packages_by_key.insert(key.clone(), package);
+
+            let mut edges: Vec<LockGraphEdge> = package
+                .dependencies
+                .iter()
+                .map(|dependency| LockGraphEdge {
+                    source: dependency.source,
+                    id: dependency.id.clone(),
+                    kind: dependency.kind,
+                    constraint: dependency.constraint.clone(),
+                })
+                .collect();
+            edges.sort_by(|left, right| {
+                lock_graph_key(left.source, &left.id).cmp(&lock_graph_key(right.source, &right.id))
+            });
+
+            for edge in &edges {
+                let target_key = lock_graph_key(edge.source, &edge.id);
+                reverse_edges
+                    .entry(target_key)
+                    .or_default()
+                    .push(ReverseLockGraphEdge {
+                        dependent_key: key.clone(),
+                        kind: edge.kind,
+                        constraint: edge.constraint.clone(),
+                    });
+            }
+            forward_edges.insert(key, edges);
+        }
+
+        for edges in reverse_edges.values_mut() {
+            edges.sort_by(|left, right| left.dependent_key.cmp(&right.dependent_key));
+        }
+
+        Self {
+            packages_by_key,
+            forward_edges,
+            reverse_edges,
+        }
+    }
+
+    fn package(&self, key: &str) -> Option<&'a LockedPackage> {
+        self.packages_by_key.get(key).copied()
+    }
+}
+
+fn cmd_tree(
+    root: &Path,
+    id: Option<String>,
+    invert: Option<String>,
+    all: bool,
+    source: Option<SourceArg>,
+) -> Result<()> {
+    let manifest = load_manifest(root)?;
+    let lock = load_lockfile_required(root)?;
+    ensure_lock_dependency_graph(&lock)?;
+    let graph = LockGraph::from_lock(&lock);
+    let source_filter = source.map(SourceArg::to_core);
+
+    let output = if let Some(query) = invert.as_deref() {
+        let target = resolve_locked_package(&lock, query, source_filter)?;
+        render_reverse_dependency_tree(&graph, target)
+    } else if all {
+        let packages = sorted_lock_packages(&lock);
+        render_forward_dependency_forest(&graph, &packages)
+    } else if let Some(query) = id.as_deref() {
+        let target = resolve_locked_package(&lock, query, source_filter)?;
+        render_forward_dependency_forest(&graph, &[target])
+    } else {
+        let roots = resolve_manifest_root_packages(&manifest, &lock)?;
+        render_forward_dependency_forest(&graph, &roots)
+    };
+
+    print!("{output}");
+    Ok(())
+}
+
+fn cmd_why(root: &Path, id: &str, source: Option<SourceArg>) -> Result<()> {
+    let manifest = load_manifest(root)?;
+    let lock = load_lockfile_required(root)?;
+    ensure_lock_dependency_graph(&lock)?;
+    let graph = LockGraph::from_lock(&lock);
+    let roots = resolve_manifest_root_packages(&manifest, &lock)?;
+    let target = resolve_locked_package(&lock, id, source.map(SourceArg::to_core))?;
+    let output = render_why_report(&graph, &roots, target)?;
+    print!("{output}");
+    Ok(())
+}
+
+fn render_why_report(
+    graph: &LockGraph<'_>,
+    roots: &[&LockedPackage],
+    target: &LockedPackage,
+) -> Result<String> {
+    let target_key = locked_package_graph_key(target);
+    let root_keys: Vec<String> = roots
+        .iter()
+        .map(|package| locked_package_graph_key(package))
+        .collect();
+
+    if root_keys.iter().any(|key| key == &target_key) {
+        return Ok(format!(
+            "{} is a direct dependency\n{}\n",
+            locked_package_display(target),
+            locked_package_display(target)
+        ));
+    }
+
+    let mut distance: HashMap<String, usize> = HashMap::new();
+    let mut predecessors: HashMap<String, Vec<String>> = HashMap::new();
+    let mut queue = VecDeque::new();
+
+    for root_key in &root_keys {
+        distance.insert(root_key.clone(), 0);
+        queue.push_back(root_key.clone());
+    }
+
+    while let Some(current) = queue.pop_front() {
+        let current_distance = distance.get(&current).copied().unwrap_or(0);
+        for edge in graph.forward_edges.get(&current).into_iter().flatten() {
+            if edge.kind != LockedDependencyKind::Required {
+                continue;
+            }
+            let next_key = lock_graph_key(edge.source, &edge.id);
+            if graph.package(&next_key).is_none() {
+                continue;
+            }
+
+            match distance.get(&next_key).copied() {
+                None => {
+                    distance.insert(next_key.clone(), current_distance + 1);
+                    predecessors.insert(next_key.clone(), vec![current.clone()]);
+                    queue.push_back(next_key);
+                }
+                Some(existing) if existing == current_distance + 1 => {
+                    predecessors
+                        .entry(next_key)
+                        .or_default()
+                        .push(current.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !distance.contains_key(&target_key) {
+        bail!(
+            "{} is locked but not reachable from manifest roots; rerun `mineconda lock`",
+            locked_package_display(target)
+        );
+    }
+
+    let mut paths = Vec::new();
+    let mut current = vec![target_key.clone()];
+    collect_why_paths(&predecessors, &root_keys, &mut current, &mut paths);
+    let mut rendered_paths: Vec<String> = paths
+        .into_iter()
+        .map(|path| {
+            path.into_iter()
+                .map(|key| {
+                    graph
+                        .package(&key)
+                        .map(locked_package_display)
+                        .unwrap_or(key)
+                })
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        })
+        .collect();
+    rendered_paths.sort();
+    rendered_paths.dedup();
+
+    let mut lines = vec![format!(
+        "{} is a transitive dependency",
+        locked_package_display(target)
+    )];
+    lines.extend(rendered_paths.into_iter().map(|path| format!("- {path}")));
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn collect_why_paths(
+    predecessors: &HashMap<String, Vec<String>>,
+    root_keys: &[String],
+    current_path: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    let Some(current_key) = current_path.last().cloned() else {
+        return;
+    };
+
+    if root_keys.iter().any(|key| key == &current_key) {
+        let mut path = current_path.clone();
+        path.reverse();
+        out.push(path);
+        return;
+    }
+
+    let Some(previous) = predecessors.get(&current_key) else {
+        return;
+    };
+
+    for predecessor in previous {
+        current_path.push(predecessor.clone());
+        collect_why_paths(predecessors, root_keys, current_path, out);
+        current_path.pop();
+    }
+}
+
+fn render_forward_dependency_forest(graph: &LockGraph<'_>, roots: &[&LockedPackage]) -> String {
+    let mut lines = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        if index > 0 {
+            lines.push(String::new());
+        }
+        let key = locked_package_graph_key(root);
+        render_forward_tree_node(graph, &key, "", true, None, &mut Vec::new(), &mut lines);
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn render_reverse_dependency_tree(graph: &LockGraph<'_>, root: &LockedPackage) -> String {
+    let mut lines = Vec::new();
+    let key = locked_package_graph_key(root);
+    render_reverse_tree_node(graph, &key, "", true, None, &mut Vec::new(), &mut lines);
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn render_forward_tree_node(
+    graph: &LockGraph<'_>,
+    key: &str,
+    prefix: &str,
+    is_last: bool,
+    incoming: Option<&LockGraphEdge>,
+    path: &mut Vec<String>,
+    lines: &mut Vec<String>,
+) {
+    let connector = if incoming.is_none() {
+        ""
+    } else if is_last {
+        "`-- "
+    } else {
+        "|-- "
+    };
+
+    if path.iter().any(|entry| entry == key) {
+        lines.push(format!("{prefix}{connector}{key} (cycle)"));
+        return;
+    }
+
+    let label = if let Some(package) = graph.package(key) {
+        locked_package_display(package)
+    } else if let Some(edge) = incoming {
+        format!("{} [{}] <not-locked>", edge.id, edge.source.as_str())
+    } else {
+        key.to_string()
+    };
+    let edge_label = incoming.map(format_tree_edge_label).unwrap_or_default();
+    lines.push(format!("{prefix}{connector}{label}{edge_label}"));
+
+    path.push(key.to_string());
+    let child_prefix = if incoming.is_none() {
+        String::new()
+    } else if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}|   ")
+    };
+
+    let edges = graph.forward_edges.get(key).cloned().unwrap_or_default();
+    for (index, edge) in edges.iter().enumerate() {
+        let child_key = lock_graph_key(edge.source, &edge.id);
+        render_forward_tree_node(
+            graph,
+            &child_key,
+            &child_prefix,
+            index + 1 == edges.len(),
+            Some(edge),
+            path,
+            lines,
+        );
+    }
+    path.pop();
+}
+
+fn render_reverse_tree_node(
+    graph: &LockGraph<'_>,
+    key: &str,
+    prefix: &str,
+    is_last: bool,
+    incoming: Option<&ReverseLockGraphEdge>,
+    path: &mut Vec<String>,
+    lines: &mut Vec<String>,
+) {
+    let connector = if incoming.is_none() {
+        ""
+    } else if is_last {
+        "`-- "
+    } else {
+        "|-- "
+    };
+
+    if path.iter().any(|entry| entry == key) {
+        lines.push(format!("{prefix}{connector}{key} (cycle)"));
+        return;
+    }
+
+    let label = graph
+        .package(key)
+        .map(locked_package_display)
+        .unwrap_or_else(|| key.to_string());
+    let edge_label = incoming
+        .map(format_reverse_tree_edge_label)
+        .unwrap_or_default();
+    lines.push(format!("{prefix}{connector}{label}{edge_label}"));
+
+    path.push(key.to_string());
+    let child_prefix = if incoming.is_none() {
+        String::new()
+    } else if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}|   ")
+    };
+
+    let edges = graph.reverse_edges.get(key).cloned().unwrap_or_default();
+    for (index, edge) in edges.iter().enumerate() {
+        render_reverse_tree_node(
+            graph,
+            &edge.dependent_key,
+            &child_prefix,
+            index + 1 == edges.len(),
+            Some(edge),
+            path,
+            lines,
+        );
+    }
+    path.pop();
+}
+
+fn format_tree_edge_label(edge: &LockGraphEdge) -> String {
+    let mut suffix = edge.kind.as_str().to_string();
+    if let Some(constraint) = edge.constraint.as_deref() {
+        suffix.push_str(&format!(", {constraint}"));
+    }
+    format!(" ({suffix})")
+}
+
+fn format_reverse_tree_edge_label(edge: &ReverseLockGraphEdge) -> String {
+    let mut suffix = format!("depended on via {}", edge.kind.as_str());
+    if let Some(constraint) = edge.constraint.as_deref() {
+        suffix.push_str(&format!(", {constraint}"));
+    }
+    format!(" ({suffix})")
+}
+
+fn ensure_lock_dependency_graph(lock: &Lockfile) -> Result<()> {
+    if lock.metadata.dependency_graph {
+        return Ok(());
+    }
+    bail!("lockfile does not contain dependency graph data; rerun `mineconda lock` first")
+}
+
+fn resolve_manifest_root_packages<'a>(
+    manifest: &Manifest,
+    lock: &'a Lockfile,
+) -> Result<Vec<&'a LockedPackage>> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for spec in &manifest.mods {
+        let package = lock
+            .packages
+            .iter()
+            .find(|package| lock_package_matches_spec(package, spec))
+            .with_context(|| {
+                format!(
+                    "manifest entry `{}` [{}] is not present in lockfile; rerun `mineconda lock`",
+                    spec.id,
+                    spec.source.as_str()
+                )
+            })?;
+        let key = locked_package_graph_key(package);
+        if seen.insert(key) {
+            roots.push(package);
+        }
+    }
+
+    Ok(roots)
+}
+
+fn resolve_locked_package<'a>(
+    lock: &'a Lockfile,
+    id: &str,
+    source: Option<ModSource>,
+) -> Result<&'a LockedPackage> {
+    let matches: Vec<&LockedPackage> = lock
+        .packages
+        .iter()
+        .filter(|package| lock_package_matches_request(package, id, source))
+        .collect();
+
+    match matches.as_slice() {
+        [] => bail!("package `{id}` not found in lockfile"),
+        [package] => Ok(*package),
+        _ => bail!("multiple lockfile entries match `{id}`, use `--source` to disambiguate"),
+    }
+}
+
+fn sorted_lock_packages(lock: &Lockfile) -> Vec<&LockedPackage> {
+    let mut packages: Vec<&LockedPackage> = lock.packages.iter().collect();
+    packages.sort_by(|left, right| {
+        locked_package_graph_key(left).cmp(&locked_package_graph_key(right))
+    });
+    packages
+}
+
+fn lock_graph_key(source: ModSource, id: &str) -> String {
+    format!("{}@{}", id, source.as_str())
+}
+
+fn locked_package_graph_key(package: &LockedPackage) -> String {
+    lock_graph_key(package.source, &package.id)
+}
+
+fn locked_package_display(package: &LockedPackage) -> String {
+    format!(
+        "{} [{}] {}",
+        package.id,
+        package.source.as_str(),
+        package.version
+    )
 }
 
 fn cmd_lock(root: &Path, upgrade: bool) -> Result<()> {
@@ -3108,13 +3599,16 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use mineconda_core::{
-        LockedPackage, Manifest, ModSide, ModSource, RuntimeProfile, ServerProfile,
+        LoaderKind, LoaderSpec, LockMetadata, LockedDependency, LockedDependencyKind,
+        LockedPackage, Lockfile, Manifest, ModSide, ModSource, ModSpec, ProjectSection,
+        RuntimeProfile, ServerProfile,
     };
     use mineconda_resolver::{SearchResult, SearchSource};
 
     use super::{
         DoctorLevel, collect_s3_doctor_findings, display_width, extract_curseforge_project_id,
-        extract_modrinth_slug, lock_package_matches_request, resolve_java_for_run,
+        extract_modrinth_slug, lock_package_matches_request, render_forward_dependency_forest,
+        render_reverse_dependency_tree, render_why_report, resolve_java_for_run,
         resolve_search_install_target, truncate_visual, wrap_visual,
     };
 
@@ -3189,6 +3683,7 @@ mod tests {
             source_ref: Some(
                 "requested=embeddium;project=sk9rgfiA;version=J7b96IEd;name=Embeddium".to_string(),
             ),
+            dependencies: Vec::new(),
         };
 
         assert!(lock_package_matches_request(
@@ -3226,6 +3721,182 @@ mod tests {
         let runtime = RuntimeProfile::default();
         let java = resolve_java_for_run(None, &server, Some(&runtime)).unwrap();
         assert_eq!(java, "/opt/java/bin/java");
+    }
+
+    fn test_manifest(mods: Vec<ModSpec>) -> Manifest {
+        Manifest {
+            project: ProjectSection {
+                name: "test-pack".to_string(),
+                minecraft: "1.21.1".to_string(),
+                loader: LoaderSpec {
+                    kind: LoaderKind::NeoForge,
+                    version: "latest".to_string(),
+                },
+            },
+            mods,
+            sources: Default::default(),
+            cache: Default::default(),
+            server: ServerProfile::default(),
+            runtime: RuntimeProfile::default(),
+        }
+    }
+
+    fn test_lockfile(packages: Vec<LockedPackage>) -> Lockfile {
+        Lockfile {
+            metadata: LockMetadata {
+                generated_by: "test".to_string(),
+                generated_at_unix: 0,
+                minecraft: "1.21.1".to_string(),
+                loader: LoaderSpec {
+                    kind: LoaderKind::NeoForge,
+                    version: "latest".to_string(),
+                },
+                dependency_graph: true,
+            },
+            packages,
+        }
+    }
+
+    fn required_dependency(id: &str) -> LockedDependency {
+        LockedDependency {
+            source: ModSource::Modrinth,
+            id: id.to_string(),
+            kind: LockedDependencyKind::Required,
+            constraint: None,
+        }
+    }
+
+    fn incompatible_dependency(id: &str) -> LockedDependency {
+        LockedDependency {
+            source: ModSource::Modrinth,
+            id: id.to_string(),
+            kind: LockedDependencyKind::Incompatible,
+            constraint: None,
+        }
+    }
+
+    fn test_package(id: &str, version: &str, dependencies: Vec<LockedDependency>) -> LockedPackage {
+        LockedPackage {
+            id: id.to_string(),
+            source: ModSource::Modrinth,
+            version: version.to_string(),
+            side: ModSide::Both,
+            file_name: format!("{id}.jar"),
+            install_path: None,
+            file_size: Some(1),
+            sha256: "deadbeef".to_string(),
+            download_url: format!("https://example.invalid/{id}.jar"),
+            hashes: Vec::new(),
+            source_ref: Some(format!(
+                "requested={id};project={id};version={version};name={id}"
+            )),
+            dependencies,
+        }
+    }
+
+    #[test]
+    fn forward_tree_renders_nested_dependencies() {
+        let alpha = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
+        let beta = test_package("beta", "1.1.0", vec![required_dependency("gamma")]);
+        let gamma = test_package("gamma", "1.2.0", Vec::new());
+        let lock = test_lockfile(vec![alpha.clone(), beta, gamma]);
+        let graph = super::LockGraph::from_lock(&lock);
+
+        let output = render_forward_dependency_forest(&graph, &[&alpha]);
+        assert_eq!(
+            output,
+            concat!(
+                "alpha [modrinth] 1.0.0\n",
+                "`-- beta [modrinth] 1.1.0 (required)\n",
+                "    `-- gamma [modrinth] 1.2.0 (required)\n",
+            )
+        );
+    }
+
+    #[test]
+    fn reverse_tree_renders_nested_dependents() {
+        let alpha = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
+        let beta = test_package("beta", "1.1.0", vec![required_dependency("gamma")]);
+        let gamma = test_package("gamma", "1.2.0", Vec::new());
+        let lock = test_lockfile(vec![alpha, beta.clone(), gamma.clone()]);
+        let graph = super::LockGraph::from_lock(&lock);
+
+        let output = render_reverse_dependency_tree(&graph, &gamma);
+        assert_eq!(
+            output,
+            concat!(
+                "gamma [modrinth] 1.2.0\n",
+                "`-- beta [modrinth] 1.1.0 (depended on via required)\n",
+                "    `-- alpha [modrinth] 1.0.0 (depended on via required)\n",
+            )
+        );
+    }
+
+    #[test]
+    fn why_report_marks_direct_dependency() {
+        let alpha = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
+        let lock = test_lockfile(vec![
+            alpha.clone(),
+            test_package("beta", "1.1.0", Vec::new()),
+        ]);
+        let graph = super::LockGraph::from_lock(&lock);
+
+        let output = render_why_report(&graph, &[&alpha], &alpha).expect("direct why report");
+        assert_eq!(
+            output,
+            "alpha [modrinth] 1.0.0 is a direct dependency\nalpha [modrinth] 1.0.0\n"
+        );
+    }
+
+    #[test]
+    fn why_report_lists_shortest_transitive_paths() {
+        let alpha = test_package("alpha", "1.0.0", vec![required_dependency("beta")]);
+        let beta = test_package("beta", "1.1.0", vec![required_dependency("gamma")]);
+        let delta = test_package("delta", "2.0.0", vec![required_dependency("gamma")]);
+        let gamma = test_package("gamma", "1.2.0", Vec::new());
+        let manifest = test_manifest(vec![
+            ModSpec::new(
+                "alpha".to_string(),
+                ModSource::Modrinth,
+                "latest".to_string(),
+                ModSide::Both,
+            ),
+            ModSpec::new(
+                "delta".to_string(),
+                ModSource::Modrinth,
+                "latest".to_string(),
+                ModSide::Both,
+            ),
+        ]);
+        let lock = test_lockfile(vec![alpha.clone(), beta, delta.clone(), gamma.clone()]);
+        let graph = super::LockGraph::from_lock(&lock);
+        let roots =
+            super::resolve_manifest_root_packages(&manifest, &lock).expect("manifest roots");
+
+        let output = render_why_report(&graph, &roots, &gamma).expect("transitive why report");
+        assert_eq!(
+            output,
+            concat!(
+                "gamma [modrinth] 1.2.0 is a transitive dependency\n",
+                "- delta [modrinth] 2.0.0 -> gamma [modrinth] 1.2.0\n",
+            )
+        );
+    }
+
+    #[test]
+    fn why_report_ignores_incompatible_edges() {
+        let alpha = test_package("alpha", "1.0.0", vec![incompatible_dependency("gamma")]);
+        let gamma = test_package("gamma", "1.2.0", Vec::new());
+        let lock = test_lockfile(vec![alpha.clone(), gamma.clone()]);
+        let graph = super::LockGraph::from_lock(&lock);
+
+        let error =
+            render_why_report(&graph, &[&alpha], &gamma).expect_err("should be unreachable");
+        assert!(
+            error
+                .to_string()
+                .contains("gamma [modrinth] 1.2.0 is locked but not reachable from manifest roots")
+        );
     }
 
     #[test]
