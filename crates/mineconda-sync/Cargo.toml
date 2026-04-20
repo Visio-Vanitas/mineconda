@@ -1,0 +1,17 @@
+[package]
+name = "mineconda-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rayon.workspace = true
+quick-xml.workspace = true
+time.workspace = true
+serde.workspace = true
+mineconda-core = { path = "../mineconda-core" }

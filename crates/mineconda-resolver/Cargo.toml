@@ -1,0 +1,14 @@
+[package]
+name = "mineconda-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+mineconda-core = { path = "../mineconda-core" }
