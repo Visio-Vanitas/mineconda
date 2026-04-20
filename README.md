@@ -1,5 +1,7 @@
 # mineconda
 
+English | [简体中文](README.zh-CN.md)
+
 `mineconda` is a Rust CLI for Minecraft modpack management, inspired by `uv`.
 
 It provides a manifest + lockfile workflow for reproducible modpack environments, with dependency resolution, cache-aware sync, runtime management, and modpack import/export.
