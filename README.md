@@ -85,7 +85,9 @@ Main commands:
 Useful package-state commands:
 
 - `mineconda lock diff` previews lockfile changes without writing them
+- `mineconda lock --check` validates the selected lock surface without rewriting `mineconda.lock`
 - `mineconda status` reports manifest/lock/sync drift for the selected groups
+- `mineconda sync --check` validates whether the selected locked packages are installed without mutating the workspace
 - add `--json` to either command for machine-readable output and stable `0/2/1` exit codes
 - `mineconda ls --json`, `mineconda tree --json`, and `mineconda why <id> --json` expose structured package graph data for tooling
 
@@ -222,7 +224,7 @@ Current workspace boundary:
 
 - each member keeps its own `mineconda.toml` and `mineconda.lock`
 - `status` and `lock diff` support `--all-members` aggregation
-- mutating commands such as `add`, `remove`, `sync`, `run`, and `export` require `--member`
+- `lock`, `sync`, and other member-scoped commands still require `--member`, including `lock --check` and `sync --check`
 
 ## JSON Output
 

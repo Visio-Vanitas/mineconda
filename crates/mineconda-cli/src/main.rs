@@ -203,6 +203,8 @@ enum Commands {
         command: Option<LockCommands>,
         #[arg(long)]
         upgrade: bool,
+        #[arg(long)]
+        check: bool,
         #[arg(long = "group")]
         groups: Vec<String>,
         #[arg(long)]
@@ -227,6 +229,8 @@ enum Commands {
     Sync {
         #[arg(long)]
         no_prune: bool,
+        #[arg(long)]
+        check: bool,
         #[arg(long)]
         locked: bool,
         #[arg(long)]
@@ -670,6 +674,7 @@ struct WhyCommandArgs {
 #[derive(Debug)]
 struct SyncCommandArgs {
     prune: bool,
+    check: bool,
     locked: bool,
     offline: bool,
     jobs: usize,
@@ -1358,6 +1363,50 @@ fn requested_groups_fallback(groups: &[String], all_groups: bool) -> Vec<String>
     out.into_iter().collect()
 }
 
+fn format_selection_args(
+    groups: &[String],
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<String> {
+    let mut args = Vec::new();
+
+    if !all_groups {
+        for profile in normalized_profile_names(profiles)? {
+            args.push(format!("--profile {profile}"));
+        }
+    }
+
+    if all_groups {
+        args.push("--all-groups".to_string());
+    } else {
+        let mut seen = BTreeSet::new();
+        for raw in groups {
+            let group = normalize_group_selector(raw)?;
+            if !is_default_group_name(&group) && seen.insert(group.clone()) {
+                args.push(format!("--group {group}"));
+            }
+        }
+    }
+
+    if args.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!(" {}", args.join(" ")))
+    }
+}
+
+fn format_selection_command(
+    command: &str,
+    groups: &[String],
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<String> {
+    Ok(format!(
+        "{command}{}",
+        format_selection_args(groups, all_groups, profiles)?
+    ))
+}
+
 fn normalized_profile_names(profiles: &[String]) -> Result<Vec<String>> {
     profiles
         .iter()
@@ -1665,16 +1714,22 @@ fn render_lock_diff_entry(entry: &LockDiffEntry) -> String {
             entry.desired_artifact.as_deref().unwrap_or("-")
         ),
         LockDiffKind::ChangeGroups => format!(
-            "{prefix} {} -> {}",
+            "{prefix} groups: {} -> {}",
             format_group_list(&entry.current_groups),
             format_group_list(&entry.desired_groups)
         ),
         LockDiffKind::ChangeDependencies => format!(
-            "{prefix} {} -> {}",
+            "{prefix} dependencies: {} -> {}",
             format_dependency_list(&entry.current_dependencies),
             format_dependency_list(&entry.desired_dependencies)
         ),
     }
+}
+
+fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
+    bail!(
+        "workspace aggregation is currently supported only for `status` and `lock diff`; rerun `{command}` with `--member <path>`"
+    )
 }
 
 fn main() -> Result<()> {
@@ -1857,10 +1912,14 @@ fn main() -> Result<()> {
         Commands::Lock {
             command,
             upgrade,
+            check,
             groups,
             all_groups,
         } => match command {
             Some(LockCommands::Diff { json }) => {
+                if check {
+                    bail!("`mineconda lock diff` does not accept `--check`");
+                }
                 let workspace = load_workspace_optional(&root)?;
                 if workspace.is_some() && scope.all_members {
                     cmd_lock_diff_workspace(
@@ -1884,10 +1943,19 @@ fn main() -> Result<()> {
                 }
             }
             None => {
+                let workspace = load_workspace_optional(&root)?;
+                if workspace.is_some() && scope.all_members {
+                    workspace_aggregation_not_supported(if check {
+                        "mineconda lock --check"
+                    } else {
+                        "mineconda lock"
+                    })?;
+                }
                 let target = resolve_project_target(&root, &scope)?;
                 cmd_lock(
                     &target.root,
                     upgrade,
+                    check,
                     groups,
                     all_groups,
                     &scope.profiles,
@@ -1922,6 +1990,7 @@ fn main() -> Result<()> {
         Commands::Env { command } => cmd_env(&root, command, &scope)?,
         Commands::Sync {
             no_prune,
+            check,
             locked,
             frozen,
             offline,
@@ -1930,11 +1999,20 @@ fn main() -> Result<()> {
             groups,
             all_groups,
         } => {
+            let workspace = load_workspace_optional(&root)?;
+            if workspace.is_some() && scope.all_members {
+                workspace_aggregation_not_supported(if check {
+                    "mineconda sync --check"
+                } else {
+                    "mineconda sync"
+                })?;
+            }
             let target = resolve_project_target(&root, &scope)?;
             cmd_sync(
                 &target.root,
                 SyncCommandArgs {
                     prune: !no_prune,
+                    check,
                     locked: locked || frozen,
                     offline,
                     jobs,
@@ -2975,6 +3053,7 @@ fn install_search_selection(
         root,
         SyncCommandArgs {
             prune: true,
+            check: false,
             locked: false,
             offline: false,
             jobs: default_sync_jobs(),
@@ -4338,18 +4417,106 @@ fn locked_package_display(package: &LockedPackage) -> String {
 fn cmd_lock(
     root: &Path,
     upgrade: bool,
+    check: bool,
     groups: Vec<String>,
     all_groups: bool,
     profiles: &[String],
     workspace: Option<&WorkspaceConfig>,
 ) -> Result<()> {
     let manifest = load_manifest(root)?;
+    if check {
+        return emit_command_report(build_lock_check_report(
+            root, &manifest, upgrade, groups, all_groups, profiles, workspace,
+        )?);
+    }
     write_lock_from_manifest(
         root,
         &manifest,
         upgrade,
         activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?,
     )
+}
+
+fn build_lock_check_report(
+    root: &Path,
+    manifest: &Manifest,
+    upgrade: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<CommandReport> {
+    let lock_command = format_selection_command("mineconda lock", &groups, all_groups, profiles)?;
+    let active_groups =
+        activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
+    let group_label = format_active_groups(&active_groups);
+    let Some(lock) = load_lockfile_optional(root)? else {
+        return Ok(CommandReport {
+            output: format!("lock check: lockfile missing; run `{lock_command}` first\n"),
+            exit_code: 1,
+        });
+    };
+
+    if !lock.metadata.dependency_graph {
+        return Ok(CommandReport {
+            output: format!(
+                "lock check: lockfile does not contain dependency graph data; rerun `{lock_command}` first\n"
+            ),
+            exit_code: 1,
+        });
+    }
+
+    if let Err(err) = ensure_lock_group_metadata(manifest, &lock, &active_groups) {
+        return Ok(CommandReport {
+            output: format!("lock check: {err}\n"),
+            exit_code: 1,
+        });
+    }
+
+    let output = resolve_lockfile(
+        manifest,
+        Some(&lock),
+        &ResolveRequest {
+            upgrade,
+            groups: active_groups.clone(),
+        },
+    )?;
+    let current_for_diff = filtered_lockfile(&lock, &active_groups);
+    let entries = compute_lock_diff_entries(Some(&current_for_diff), &output.lockfile);
+    let report = LockDiffJsonReport {
+        command: "lock-diff",
+        groups: active_groups.iter().cloned().collect(),
+        summary: LockDiffJsonSummary {
+            install: output.plan.install.len(),
+            remove: output.plan.remove.len(),
+            unchanged: output.plan.unchanged.len(),
+            changes: entries.len(),
+        },
+        entries: entries.iter().map(lock_diff_entry_to_json).collect(),
+    };
+
+    if report.entries.is_empty() {
+        return Ok(CommandReport {
+            output: format!(
+                "lock check: up-to-date groups={group_label} install={} remove={} unchanged={} changes=0\n",
+                report.summary.install, report.summary.remove, report.summary.unchanged
+            ),
+            exit_code: 0,
+        });
+    }
+
+    let mut lines = vec![format!(
+        "lock check: stale groups={group_label} install={} remove={} unchanged={} changes={}",
+        report.summary.install,
+        report.summary.remove,
+        report.summary.unchanged,
+        report.summary.changes
+    )];
+    lines.extend(lock_diff_report_body_lines(&report));
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 2,
+    })
 }
 
 fn emit_command_report(report: CommandReport) -> Result<()> {
@@ -4409,6 +4576,89 @@ fn render_json_error_report(report: &JsonErrorReport) -> CommandReport {
     }
 }
 
+fn lock_diff_report_body_lines(report: &LockDiffJsonReport) -> Vec<String> {
+    if report.entries.is_empty() {
+        return vec!["lock diff: no changes".to_string()];
+    }
+
+    report
+        .entries
+        .iter()
+        .map(|entry| {
+            render_lock_diff_entry(&LockDiffEntry {
+                kind: match entry.kind.as_str() {
+                    "add" => LockDiffKind::Add,
+                    "remove" => LockDiffKind::Remove,
+                    "upgrade" => LockDiffKind::Upgrade,
+                    "downgrade" => LockDiffKind::Downgrade,
+                    "change_version" => LockDiffKind::ChangeVersion,
+                    "change_artifact" => LockDiffKind::ChangeArtifact,
+                    "change_groups" => LockDiffKind::ChangeGroups,
+                    "change_dependencies" => LockDiffKind::ChangeDependencies,
+                    _ => LockDiffKind::ChangeVersion,
+                },
+                id: entry.id.clone(),
+                source: match entry.source.as_str() {
+                    "modrinth" => ModSource::Modrinth,
+                    "curseforge" => ModSource::Curseforge,
+                    "url" => ModSource::Url,
+                    "local" => ModSource::Local,
+                    "s3" => ModSource::S3,
+                    _ => ModSource::Local,
+                },
+                current_version: entry.current_version.clone(),
+                desired_version: entry.desired_version.clone(),
+                current_groups: entry.current_groups.clone(),
+                desired_groups: entry.desired_groups.clone(),
+                current_dependencies: entry
+                    .current_dependencies
+                    .iter()
+                    .map(|dep| LockedDependency {
+                        source: match dep.source.as_str() {
+                            "modrinth" => ModSource::Modrinth,
+                            "curseforge" => ModSource::Curseforge,
+                            "url" => ModSource::Url,
+                            "local" => ModSource::Local,
+                            "s3" => ModSource::S3,
+                            _ => ModSource::Local,
+                        },
+                        id: dep.id.clone(),
+                        kind: match dep.kind.as_str() {
+                            "required" => LockedDependencyKind::Required,
+                            "incompatible" => LockedDependencyKind::Incompatible,
+                            _ => LockedDependencyKind::Required,
+                        },
+                        constraint: dep.constraint.clone(),
+                    })
+                    .collect(),
+                desired_dependencies: entry
+                    .desired_dependencies
+                    .iter()
+                    .map(|dep| LockedDependency {
+                        source: match dep.source.as_str() {
+                            "modrinth" => ModSource::Modrinth,
+                            "curseforge" => ModSource::Curseforge,
+                            "url" => ModSource::Url,
+                            "local" => ModSource::Local,
+                            "s3" => ModSource::S3,
+                            _ => ModSource::Local,
+                        },
+                        id: dep.id.clone(),
+                        kind: match dep.kind.as_str() {
+                            "required" => LockedDependencyKind::Required,
+                            "incompatible" => LockedDependencyKind::Incompatible,
+                            _ => LockedDependencyKind::Required,
+                        },
+                        constraint: dep.constraint.clone(),
+                    })
+                    .collect(),
+                current_artifact: entry.current_artifact.clone(),
+                desired_artifact: entry.desired_artifact.clone(),
+            })
+        })
+        .collect()
+}
+
 fn render_lock_diff_json_report(report: &LockDiffJsonReport) -> CommandReport {
     let mut lines = vec![format!(
         "lock diff: groups={} install={} remove={} unchanged={} changes={}",
@@ -4426,78 +4676,7 @@ fn render_lock_diff_json_report(report: &LockDiffJsonReport) -> CommandReport {
         };
     }
 
-    lines.extend(report.entries.iter().map(|entry| {
-        render_lock_diff_entry(&LockDiffEntry {
-            kind: match entry.kind.as_str() {
-                "add" => LockDiffKind::Add,
-                "remove" => LockDiffKind::Remove,
-                "upgrade" => LockDiffKind::Upgrade,
-                "downgrade" => LockDiffKind::Downgrade,
-                "change_version" => LockDiffKind::ChangeVersion,
-                "change_artifact" => LockDiffKind::ChangeArtifact,
-                "change_groups" => LockDiffKind::ChangeGroups,
-                "change_dependencies" => LockDiffKind::ChangeDependencies,
-                _ => LockDiffKind::ChangeVersion,
-            },
-            id: entry.id.clone(),
-            source: match entry.source.as_str() {
-                "modrinth" => ModSource::Modrinth,
-                "curseforge" => ModSource::Curseforge,
-                "url" => ModSource::Url,
-                "local" => ModSource::Local,
-                "s3" => ModSource::S3,
-                _ => ModSource::Local,
-            },
-            current_version: entry.current_version.clone(),
-            desired_version: entry.desired_version.clone(),
-            current_groups: entry.current_groups.clone(),
-            desired_groups: entry.desired_groups.clone(),
-            current_dependencies: entry
-                .current_dependencies
-                .iter()
-                .map(|dep| LockedDependency {
-                    source: match dep.source.as_str() {
-                        "modrinth" => ModSource::Modrinth,
-                        "curseforge" => ModSource::Curseforge,
-                        "url" => ModSource::Url,
-                        "local" => ModSource::Local,
-                        "s3" => ModSource::S3,
-                        _ => ModSource::Local,
-                    },
-                    id: dep.id.clone(),
-                    kind: match dep.kind.as_str() {
-                        "required" => LockedDependencyKind::Required,
-                        "incompatible" => LockedDependencyKind::Incompatible,
-                        _ => LockedDependencyKind::Required,
-                    },
-                    constraint: dep.constraint.clone(),
-                })
-                .collect(),
-            desired_dependencies: entry
-                .desired_dependencies
-                .iter()
-                .map(|dep| LockedDependency {
-                    source: match dep.source.as_str() {
-                        "modrinth" => ModSource::Modrinth,
-                        "curseforge" => ModSource::Curseforge,
-                        "url" => ModSource::Url,
-                        "local" => ModSource::Local,
-                        "s3" => ModSource::S3,
-                        _ => ModSource::Local,
-                    },
-                    id: dep.id.clone(),
-                    kind: match dep.kind.as_str() {
-                        "required" => LockedDependencyKind::Required,
-                        "incompatible" => LockedDependencyKind::Incompatible,
-                        _ => LockedDependencyKind::Required,
-                    },
-                    constraint: dep.constraint.clone(),
-                })
-                .collect(),
-            current_artifact: entry.current_artifact.clone(),
-            desired_artifact: entry.desired_artifact.clone(),
-        })
-    }));
+    lines.extend(lock_diff_report_body_lines(report));
 
     CommandReport {
         output: format!("{}\n", lines.join("\n")),
@@ -4627,6 +4806,8 @@ fn build_status_json_report(
 ) -> Result<StatusJsonReport> {
     let manifest_path = manifest_path(root);
     let lock_path = lockfile_path(root);
+    let lock_command = format_selection_command("mineconda lock", &groups, all_groups, profiles)?;
+    let sync_command = format_selection_command("mineconda sync", &groups, all_groups, profiles)?;
     let manifest = load_manifest_optional(root)?;
     let lock = load_lockfile_optional(root)?;
     let mut messages = Vec::new();
@@ -4692,6 +4873,10 @@ fn build_status_json_report(
         activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?;
     let groups = active_groups.iter().cloned().collect::<Vec<_>>();
     let selected_specs = selected_manifest_specs(&manifest, &active_groups);
+    let profile_names = normalized_profile_names(profiles)?;
+    if !profile_names.is_empty() {
+        messages.push(format!("status: profiles={}", profile_names.join(",")));
+    }
     messages.push(format!(
         "status: groups={}",
         format_active_groups(&active_groups)
@@ -4705,7 +4890,9 @@ fn build_status_json_report(
 
     let Some(lock) = lock else {
         messages.push(format!("lockfile: missing ({})", lock_path.display()));
-        messages.push("resolution: lockfile missing; run `mineconda lock`".to_string());
+        messages.push(format!(
+            "resolution: lockfile missing; run `{lock_command}`"
+        ));
         messages.push("sync: unavailable until a lockfile exists".to_string());
         return Ok(StatusJsonReport {
             command: "status",
@@ -4766,10 +4953,9 @@ fn build_status_json_report(
     if !lock.metadata.dependency_graph {
         drift = true;
         lock_usable_for_groups = false;
-        messages.push(
-            "resolution: lockfile does not contain dependency graph data; rerun `mineconda lock`"
-                .to_string(),
-        );
+        messages.push(format!(
+            "resolution: lockfile does not contain dependency graph data; rerun `{lock_command}`"
+        ));
     }
 
     let group_coverage =
@@ -4818,6 +5004,7 @@ fn build_status_json_report(
                 output.plan.unchanged.len(),
                 entries.len()
             ));
+            messages.push(format!("next: run `{lock_command}`"));
         }
 
         let filtered = filtered_lockfile(&lock, &active_groups);
@@ -4836,6 +5023,9 @@ fn build_status_json_report(
             missing,
             filtered.packages.len()
         ));
+        if missing > 0 {
+            messages.push(format!("next: run `{sync_command}`"));
+        }
         sync = StatusJsonSync {
             installed: Some(installed),
             missing: Some(missing),
@@ -4843,6 +5033,7 @@ fn build_status_json_report(
         };
     } else {
         messages.push("sync: unavailable until the lockfile is regenerated".to_string());
+        messages.push(format!("next: run `{lock_command}`"));
         sync = StatusJsonSync {
             installed: None,
             missing: None,
@@ -5724,6 +5915,7 @@ fn cmd_sync(
 ) -> Result<()> {
     let SyncCommandArgs {
         prune,
+        check,
         locked,
         offline,
         jobs,
@@ -5731,9 +5923,27 @@ fn cmd_sync(
         groups,
         all_groups,
     } = args;
-    let manifest = load_manifest_optional(root)?;
     if jobs == 0 {
         bail!("sync --jobs must be >= 1");
+    }
+    let manifest = load_manifest_optional(root)?;
+    if check {
+        return emit_command_report(build_sync_check_report(
+            root,
+            manifest.as_ref(),
+            SyncCommandArgs {
+                prune,
+                check,
+                locked,
+                offline,
+                jobs,
+                verbose_cache,
+                groups,
+                all_groups,
+            },
+            profiles,
+            workspace,
+        )?);
     }
     let mut lock = load_lockfile_required(root)?;
     let active_groups = if let Some(manifest) = manifest.as_ref() {
@@ -5793,6 +6003,91 @@ fn cmd_sync(
         report.failed
     );
     Ok(())
+}
+
+fn build_sync_check_report(
+    root: &Path,
+    manifest: Option<&Manifest>,
+    args: SyncCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<CommandReport> {
+    let SyncCommandArgs {
+        groups, all_groups, ..
+    } = args;
+    let lock_command = format_selection_command("mineconda lock", &groups, all_groups, profiles)?;
+    let sync_command = format_selection_command("mineconda sync", &groups, all_groups, profiles)?;
+    let Some(lock) = load_lockfile_optional(root)? else {
+        return Ok(CommandReport {
+            output: format!("sync check: lockfile missing; run `{lock_command}` first\n"),
+            exit_code: 1,
+        });
+    };
+    let active_groups = if let Some(manifest) = manifest {
+        let groups =
+            activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
+        ensure_lock_covers_groups(manifest, &lock, &groups)?;
+        groups
+    } else if !groups.is_empty() || all_groups || !profiles.is_empty() {
+        bail!("group/profile filters require a manifest");
+    } else {
+        BTreeSet::new()
+    };
+
+    let filtered = if active_groups.is_empty() {
+        lock.clone()
+    } else {
+        filtered_lockfile(&lock, &active_groups)
+    };
+    let mut packages: Vec<&LockedPackage> = filtered.packages.iter().collect();
+    packages.sort_by(|left, right| {
+        locked_package_graph_key(left).cmp(&locked_package_graph_key(right))
+    });
+
+    let mut missing = Vec::new();
+    for package in packages {
+        let target = package_install_target_path(root, package);
+        if !target.exists() {
+            missing.push((package, target));
+        }
+    }
+
+    let package_count = filtered.packages.len();
+    let installed = package_count.saturating_sub(missing.len());
+    let group_label = if active_groups.is_empty() {
+        "all-locked".to_string()
+    } else {
+        format_active_groups(&active_groups)
+    };
+
+    if missing.is_empty() {
+        return Ok(CommandReport {
+            output: format!(
+                "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}\n"
+            ),
+            exit_code: 0,
+        });
+    }
+
+    let mut lines = vec![format!(
+        "sync check: missing groups={group_label} installed={installed} missing={} packages={package_count}",
+        missing.len()
+    )];
+    for (package, target) in missing {
+        lines.push(format!(
+            "- {} [{}] {} -> {} groups={}",
+            package.id,
+            package.source.as_str(),
+            package.version,
+            target.display(),
+            format_group_list(&normalized_package_groups(package))
+        ));
+    }
+    lines.push(format!("next: run `{sync_command}`"));
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 2,
+    })
 }
 
 fn merge_synced_lock_packages(lock: &mut Lockfile, synced: &Lockfile) {
@@ -6672,15 +6967,15 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Cli, DoctorLevel, LockDiffKind, ProjectSelection, ScopeArgs, TreeCommandArgs,
-        WhyCommandArgs, activation_groups_with_profiles, build_lock_diff_json_report,
-        build_status_json_report, build_tree_json_report, build_why_json_report,
-        collect_s3_doctor_findings, compute_lock_diff_entries, display_width,
-        extract_curseforge_project_id, extract_modrinth_slug, lock_package_matches_request,
-        render_forward_dependency_forest, render_lock_diff_entry, render_lock_diff_json_report,
-        render_reverse_dependency_tree, render_status_json_report, render_why_report,
-        resolve_java_for_run, resolve_project_target, resolve_search_install_target,
-        truncate_visual, wrap_visual,
+        Cli, DoctorLevel, LockDiffKind, ProjectSelection, ScopeArgs, SyncCommandArgs,
+        TreeCommandArgs, WhyCommandArgs, activation_groups_with_profiles, build_lock_check_report,
+        build_lock_diff_json_report, build_status_json_report, build_sync_check_report,
+        build_tree_json_report, build_why_json_report, collect_s3_doctor_findings,
+        compute_lock_diff_entries, display_width, extract_curseforge_project_id,
+        extract_modrinth_slug, lock_package_matches_request, render_forward_dependency_forest,
+        render_lock_diff_entry, render_lock_diff_json_report, render_reverse_dependency_tree,
+        render_status_json_report, render_why_report, resolve_java_for_run, resolve_project_target,
+        resolve_search_install_target, truncate_visual, wrap_visual,
     };
 
     #[test]
@@ -7082,6 +7377,25 @@ groups = ["client", "dev"]
     }
 
     #[test]
+    fn cli_parses_check_flags_for_lock_and_sync() {
+        let cli = Cli::try_parse_from(["mineconda", "lock", "--check"]).expect("lock check parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Lock {
+                command: None,
+                check: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["mineconda", "sync", "--check"]).expect("sync check parse");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Sync { check: true, .. }
+        ));
+    }
+
+    #[test]
     fn cli_parses_workspace_profile_and_json_flags() {
         let cli = Cli::try_parse_from([
             "mineconda",
@@ -7176,8 +7490,159 @@ groups = ["client", "dev"]
 
         assert_eq!(
             line,
-            "CHANGE GROUPS iris [modrinth] default -> default,client"
+            "CHANGE GROUPS iris [modrinth] groups: default -> default,client"
         );
+    }
+
+    #[test]
+    fn lock_check_report_is_clean_for_matching_lockfile() {
+        let project = TempProject::new("lock-check-clean");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve local lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let report = build_lock_check_report(
+            &project.path,
+            &manifest,
+            false,
+            Vec::new(),
+            false,
+            &[],
+            None,
+        )
+        .expect("lock check report");
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("lock check: up-to-date"));
+    }
+
+    #[test]
+    fn lock_check_report_marks_manifest_drift() {
+        let project = TempProject::new("lock-check-drift");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("demo jar");
+        fs::write(project.path.join("vendor/extra.jar"), b"extra").expect("extra jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve local lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let updated_manifest = test_manifest(vec![
+            ModSpec::new(
+                "demo".to_string(),
+                ModSource::Local,
+                "vendor/demo.jar".to_string(),
+                ModSide::Both,
+            ),
+            ModSpec::new(
+                "extra".to_string(),
+                ModSource::Local,
+                "vendor/extra.jar".to_string(),
+                ModSide::Both,
+            ),
+        ]);
+        write_manifest(&manifest_path(&project.path), &updated_manifest).expect("rewrite manifest");
+
+        let report = build_lock_check_report(
+            &project.path,
+            &updated_manifest,
+            false,
+            Vec::new(),
+            false,
+            &[],
+            None,
+        )
+        .expect("lock check report");
+        assert_eq!(report.exit_code, 2);
+        assert!(report.output.contains("lock check: stale"));
+        assert!(report.output.contains("ADD extra [local]"));
+    }
+
+    #[test]
+    fn lock_check_report_requires_existing_lockfile() {
+        let project = TempProject::new("lock-check-missing");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+
+        let report = build_lock_check_report(
+            &project.path,
+            &manifest,
+            false,
+            Vec::new(),
+            false,
+            &[],
+            None,
+        )
+        .expect("lock check report");
+        assert_eq!(report.exit_code, 1);
+        assert!(report.output.contains("lock check: lockfile missing"));
+        assert!(report.output.contains("run `mineconda lock` first"));
+    }
+
+    #[test]
+    fn lock_check_report_requires_dependency_graph_metadata() {
+        let project = TempProject::new("lock-check-metadata");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+
+        let mut lock = test_lockfile(vec![LockedPackage::placeholder(&manifest.mods[0])]);
+        lock.metadata.dependency_graph = false;
+        write_lockfile(&lockfile_path(&project.path), &lock).expect("write lock");
+
+        let report = build_lock_check_report(
+            &project.path,
+            &manifest,
+            false,
+            Vec::new(),
+            false,
+            &[],
+            None,
+        )
+        .expect("lock check report");
+        assert_eq!(report.exit_code, 1);
+        assert!(report.output.contains("dependency graph data"));
     }
 
     #[test]
@@ -7313,6 +7778,153 @@ mods = [
             .expect("lock diff report")
             .expect("lock diff should succeed");
         assert!(diff.entries.is_empty());
+    }
+
+    #[test]
+    fn sync_check_report_detects_missing_and_installed_packages() {
+        let project = TempProject::new("sync-check-installed");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let missing = build_sync_check_report(
+            &project.path,
+            Some(&manifest),
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync check report");
+        assert_eq!(missing.exit_code, 2);
+        assert!(missing.output.contains("sync check: missing"));
+        assert!(missing.output.contains("run `mineconda sync`"));
+
+        fs::create_dir_all(project.path.join("mods")).expect("mods dir");
+        let package = output.lockfile.packages.first().expect("package");
+        fs::write(
+            project.path.join(package.install_path_or_default()),
+            b"installed",
+        )
+        .expect("installed package");
+
+        let installed = build_sync_check_report(
+            &project.path,
+            Some(&manifest),
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync check report");
+        assert_eq!(installed.exit_code, 0);
+        assert!(installed.output.contains("sync check: installed"));
+    }
+
+    #[test]
+    fn sync_check_ignores_inactive_group_entries() {
+        let project = TempProject::new("sync-check-inactive-groups");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("demo jar");
+        fs::write(project.path.join("vendor/iris.jar"), b"iris").expect("iris jar");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "demo"
+source = "local"
+version = "vendor/demo.jar"
+side = "both"
+
+[groups.client]
+mods = [
+  { id = "iris", source = "local", version = "vendor/iris.jar", side = "client" }
+]
+"#,
+        )
+        .expect("manifest");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string(), "client".to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+        fs::create_dir_all(project.path.join("mods")).expect("mods dir");
+        let default_package = output
+            .lockfile
+            .packages
+            .iter()
+            .find(|package| package.id == "demo")
+            .expect("default package");
+        fs::write(
+            project.path.join(default_package.install_path_or_default()),
+            b"installed",
+        )
+        .expect("installed package");
+
+        let report = build_sync_check_report(
+            &project.path,
+            Some(&manifest),
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync check report");
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("sync check: installed"));
     }
 
     #[test]

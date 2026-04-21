@@ -85,7 +85,9 @@ mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [-
 适合查看包状态的命令：
 
 - `mineconda lock diff`：只预览锁文件变化，不写回
+- `mineconda lock --check`：只校验所选锁定面，不改写 `mineconda.lock`
 - `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
+- `mineconda sync --check`：只校验所选锁定包是否已安装，不改动工作区
 - 两个命令都支持 `--json`，可用于脚本集成，并保持稳定的 `0/2/1` 退出码
 - `mineconda ls --json`、`mineconda tree --json`、`mineconda why <id> --json` 可输出结构化依赖数据
 
@@ -219,7 +221,7 @@ mineconda --all-members lock diff --json
 
 - 每个 member 仍各自维护 `mineconda.toml` 和 `mineconda.lock`
 - 目前支持 `status` 和 `lock diff` 的 `--all-members` 聚合
-- `add`、`remove`、`sync`、`run`、`export` 这类会改动或执行的命令仍要求显式 `--member`
+- `lock`、`sync` 以及其他 member 级命令仍要求显式 `--member`，`lock --check` / `sync --check` 也不例外
 
 ## JSON 输出
 
