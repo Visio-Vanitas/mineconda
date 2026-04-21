@@ -28,7 +28,7 @@ Primary capabilities implemented now:
 - `docs/`: architecture notes
 - `scripts/ci-smoke.sh`: end-to-end smoke test script
 - `.github/workflows/test.yml`: CI test pipeline
-- `.github/workflows/s3-smoke.yml`: self-hosted/manual S3 smoke pipeline
+- `.github/workflows/s3-smoke.yml`: manual/remote-target S3 smoke pipeline
 
 ## Project Files
 - `mineconda.toml`: desired project state
@@ -110,6 +110,6 @@ Smoke workspace:
   - environment-specific log wording
 - optional remote S3 smoke entry: `scripts/s3-smoke-remote.sh`
 - real NeoForge server smoke entry: `scripts/actual-neoforge-server-smoke.sh`
-- S3 smoke is local/self-hosted only; CI baseline does not inject S3 smoke env
+- S3 smoke is remote-target only; CI baseline does not inject S3 smoke env
 - treat S3 as experimental in user-facing behavior and diagnostics unless explicitly validating that path
 - `cache remote-prune --s3` currently belongs to enhanced S3 smoke, not baseline smoke

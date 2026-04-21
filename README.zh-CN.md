@@ -275,6 +275,24 @@ mineconda --all-members lock diff --json
 - `mineconda --help`
 - `mineconda <command> --help`
 
+## 实验性 S3 验证
+
+S3 仍然是实验能力。它适合作为显式启用的源/缓存路径，不属于当前稳定基线。
+
+- `mineconda doctor` 会把 S3 配置问题报告为非阻断 warning，并明确标注该能力仍是实验性
+- `mineconda sync` 和 `mineconda cache remote-prune --s3` 的输出会显式提示当前命中了实验性 S3 路径
+- 可选的远程烟测必须通过显式环境变量启用，并且只应指向可丢弃的实验目标
+
+示例：
+
+```bash
+MINECONDA_ENABLE_S3_SMOKE=1 \
+MINECONDA_S3_SSH_TARGET='<remote-ssh-target>' \
+MINECONDA_S3_REMOTE_PRIVILEGE_SECRET='<可选的远程提权 secret>' \
+MINECONDA_BIN="$(pwd)/target/release/mineconda" \
+bash scripts/ci-smoke.sh
+```
+
 ## 开发
 
 推荐本地验证流程：

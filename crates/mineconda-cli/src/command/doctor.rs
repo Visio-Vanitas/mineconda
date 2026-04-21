@@ -51,8 +51,10 @@ where
         .mods
         .iter()
         .any(|entry| entry.source == ModSource::S3);
+    let has_any_s3 =
+        has_s3_source_mods || manifest.sources.s3.is_some() || manifest.cache.s3.is_some();
     let Some(s3_cache) = manifest.cache.s3.as_ref() else {
-        if !has_s3_source_mods {
+        if !has_any_s3 {
             return Vec::new();
         }
         let mut findings = Vec::new();
@@ -63,6 +65,7 @@ where
         ));
         findings.extend(collect_s3_source_doctor_findings(
             manifest.sources.s3.as_ref(),
+            manifest.sources.s3.is_some(),
             has_s3_source_mods,
         ));
         return findings;
@@ -75,6 +78,7 @@ where
     )];
     findings.extend(collect_s3_source_doctor_findings(
         manifest.sources.s3.as_ref(),
+        manifest.sources.s3.is_some(),
         has_s3_source_mods,
     ));
     findings.extend(collect_s3_cache_doctor_findings(s3_cache, &mut has_env));
@@ -83,15 +87,24 @@ where
 
 fn collect_s3_source_doctor_findings(
     source: Option<&S3SourceConfig>,
+    has_source_config: bool,
     has_s3_source_mods: bool,
 ) -> Vec<DoctorFinding> {
-    if !has_s3_source_mods {
+    if !has_s3_source_mods && !has_source_config {
         return Vec::new();
     }
 
     let finding = match source {
         Some(s3) if !s3.bucket.trim().is_empty() => {
-            let mut detail = format!("bucket={}", s3.bucket);
+            let mut detail = format!(
+                "bucket={} delivery={}",
+                s3.bucket,
+                s3_delivery_mode(
+                    s3.public_base_url.as_deref(),
+                    s3.endpoint.as_deref(),
+                    s3.path_style,
+                )
+            );
             if let Some(prefix) = s3
                 .key_prefix
                 .as_deref()
@@ -99,6 +112,9 @@ fn collect_s3_source_doctor_findings(
                 .filter(|value| !value.is_empty())
             {
                 detail.push_str(&format!(" prefix={prefix}"));
+            }
+            if !has_s3_source_mods {
+                detail.push_str(" unused-by-current-mods");
             }
             DoctorFinding::new(DoctorLevel::Ok, "s3 source config", detail)
         }
@@ -134,10 +150,32 @@ where
             "cache.s3.enabled=true but bucket is empty",
         ));
     } else {
+        let mut detail = format!(
+            "enabled bucket={} delivery={} upload={}",
+            s3_cache.bucket,
+            s3_delivery_mode(
+                s3_cache.public_base_url.as_deref(),
+                s3_cache.endpoint.as_deref(),
+                s3_cache.path_style,
+            ),
+            if s3_cache.upload_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(prefix) = s3_cache
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            detail.push_str(&format!(" prefix={prefix}"));
+        }
         findings.push(DoctorFinding::new(
             DoctorLevel::Ok,
             "s3 cache config",
-            format!("enabled bucket={}", s3_cache.bucket),
+            detail,
         ));
     }
 
@@ -245,6 +283,83 @@ where
     }
 
     findings
+}
+
+pub(crate) fn collect_s3_remote_smoke_doctor_findings<F>(
+    smoke_enabled: bool,
+    mut has_env: F,
+) -> Vec<DoctorFinding>
+where
+    F: FnMut(&str) -> bool,
+{
+    if !smoke_enabled {
+        return Vec::new();
+    }
+
+    let mut findings = vec![DoctorFinding::new(
+        DoctorLevel::Ok,
+        "s3 smoke status",
+        "experimental remote smoke requested by MINECONDA_ENABLE_S3_SMOKE=1",
+    )];
+
+    findings.push(if has_env("MINECONDA_S3_SSH_TARGET") {
+        DoctorFinding::new(
+            DoctorLevel::Ok,
+            "s3 smoke target",
+            "remote smoke target configured",
+        )
+    } else {
+        DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 smoke target",
+            "MINECONDA_S3_SSH_TARGET is not set",
+        )
+    });
+
+    findings.push(if has_env("MINECONDA_S3_REMOTE_PRIVILEGE_SECRET") {
+        DoctorFinding::new(
+            DoctorLevel::Ok,
+            "s3 smoke privilege",
+            "remote privilege secret is set",
+        )
+    } else {
+        DoctorFinding::new(
+            DoctorLevel::Warn,
+            "s3 smoke privilege",
+            "MINECONDA_S3_REMOTE_PRIVILEGE_SECRET is not set; remote automation must rely on passwordless container access or another non-interactive privilege path",
+        )
+    });
+
+    findings
+}
+
+fn s3_delivery_mode(
+    public_base_url: Option<&str>,
+    endpoint: Option<&str>,
+    path_style: bool,
+) -> &'static str {
+    if public_base_url.is_some_and(|value| !value.trim().is_empty()) {
+        "public-base-url"
+    } else if endpoint.is_some_and(|value| !value.trim().is_empty()) {
+        if path_style {
+            "custom-endpoint(path-style)"
+        } else {
+            "custom-endpoint(virtual-hosted)"
+        }
+    } else {
+        "derived-service-url"
+    }
+}
+
+fn experimental_s3_smoke_enabled() -> bool {
+    env::var("MINECONDA_ENABLE_S3_SMOKE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
 }
 
 pub(crate) fn cmd_doctor(root: &Path, strict: bool, no_color: bool) -> Result<()> {
@@ -378,6 +493,27 @@ pub(crate) fn cmd_doctor(root: &Path, strict: bool, no_color: bool) -> Result<()
                 finding.detail,
                 use_color,
             );
+        }
+        let has_any_s3 = manifest
+            .mods
+            .iter()
+            .any(|entry| entry.source == ModSource::S3)
+            || manifest.sources.s3.is_some()
+            || manifest.cache.s3.is_some();
+        if has_any_s3 || experimental_s3_smoke_enabled() {
+            for finding in
+                collect_s3_remote_smoke_doctor_findings(experimental_s3_smoke_enabled(), |name| {
+                    env::var_os(name).is_some()
+                })
+            {
+                doctor_log(
+                    &mut counts,
+                    finding.level,
+                    finding.title,
+                    finding.detail,
+                    use_color,
+                );
+            }
         }
 
         if manifest.server.java != "java" {
@@ -638,5 +774,34 @@ secret_key_env = "SECRET_KEY"
                 .iter()
                 .any(|finding| finding.detail == "SECRET_KEY is not set")
         );
+        assert!(findings.iter().any(|finding| {
+            finding.title == "s3 cache config"
+                && finding.detail.contains("delivery=derived-service-url")
+        }));
+    }
+
+    #[test]
+    fn s3_doctor_findings_surface_remote_smoke_env_without_values() {
+        let findings = collect_s3_remote_smoke_doctor_findings(true, |name| {
+            matches!(name, "MINECONDA_S3_SSH_TARGET")
+        });
+
+        assert!(findings.iter().any(|finding| {
+            finding.title == "s3 smoke status"
+                && finding.detail.contains("MINECONDA_ENABLE_S3_SMOKE=1")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.title == "s3 smoke target" && finding.level == DoctorLevel::Ok
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.title == "s3 smoke privilege"
+                && finding.level == DoctorLevel::Warn
+                && finding
+                    .detail
+                    .contains("MINECONDA_S3_REMOTE_PRIVILEGE_SECRET")
+        }));
+        assert!(findings.iter().all(|finding| {
+            !finding.detail.contains("ssh://") && !finding.detail.contains("127.0.0.1")
+        }));
     }
 }

@@ -279,6 +279,24 @@ For full config details, use:
 - `mineconda --help`
 - `mineconda <command> --help`
 
+## Experimental S3 Validation
+
+S3 support remains experimental. Treat it as an opt-in source/cache path, not part of the stable baseline.
+
+- `mineconda doctor` reports S3 config problems as non-blocking warnings and keeps the feature marked experimental
+- `mineconda sync` and `mineconda cache remote-prune --s3` now make the experimental path explicit in user-facing output
+- the optional remote smoke requires explicit environment variables and should be run only against a disposable experimental target
+
+Example smoke entry:
+
+```bash
+MINECONDA_ENABLE_S3_SMOKE=1 \
+MINECONDA_S3_SSH_TARGET='<remote-ssh-target>' \
+MINECONDA_S3_REMOTE_PRIVILEGE_SECRET='<optional-remote-privilege-secret>' \
+MINECONDA_BIN="$(pwd)/target/release/mineconda" \
+bash scripts/ci-smoke.sh
+```
+
 ## Development
 
 Recommended local pipeline:

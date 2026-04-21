@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${MINECONDA_BIN:-$ROOT_DIR/target/debug/mineconda}"
 
+require_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    echo "[ci-smoke] failed: $name is required for this smoke path"
+    exit 1
+  fi
+}
+
 if [[ ! -x "$BIN" ]]; then
   echo "[ci-smoke] mineconda binary not found at $BIN, building..."
   cargo build -p mineconda-cli >/dev/null
@@ -634,8 +642,17 @@ if [[ ! -f "$PROJECT_ROOT/vendor/jei.jar" ]]; then
 fi
 
 if [[ "${MINECONDA_ENABLE_S3_SMOKE:-0}" == "1" ]]; then
+  require_env MINECONDA_S3_SSH_TARGET
   echo "[ci-smoke] experimental s3 smoke via remote target (optional)"
   "$ROOT_DIR/scripts/s3-smoke-remote.sh" "$BIN" "$PROJECT_ROOT"
+
+  echo "[ci-smoke] doctor after experimental s3 smoke"
+  doctor_s3_out="$("$BIN" --root "$PROJECT_ROOT" doctor)"
+  printf '%s\n' "$doctor_s3_out"
+  printf '%s\n' "$doctor_s3_out" | rg -q '\[ok\] s3 status: experimental feature; not part of the stable baseline'
+  printf '%s\n' "$doctor_s3_out" | rg -q 's3 source config: bucket='
+  printf '%s\n' "$doctor_s3_out" | rg -q 's3 cache config: enabled bucket='
+  printf '%s\n' "$doctor_s3_out" | rg -q 's3 smoke status: experimental remote smoke requested'
 else
   echo "[ci-smoke] skip optional s3 smoke (set MINECONDA_ENABLE_S3_SMOKE=1 to enable)"
 fi

@@ -325,9 +325,14 @@ pub fn remote_prune_s3_cache(
             continuation_token.as_deref(),
         )?;
         let response = execute_s3_request(&client, Method::GET, &target, None, &backend, None)?;
-        let response = response
-            .error_for_status()
-            .with_context(|| format!("s3 list returned error for {}", target.url))?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 list returned {} for {}{}",
+                response.status(),
+                target.url,
+                s3_http_status_hint("list", response.status(), &backend)
+            );
+        }
         let body = response
             .text()
             .with_context(|| format!("failed to decode {}", target.url))?;
@@ -360,9 +365,14 @@ pub fn remote_prune_s3_cache(
         let target =
             build_s3_object_target(&backend.config, &item.key, backend.uses_signed_auth())?;
         let response = execute_s3_request(&client, Method::DELETE, &target, None, &backend, None)?;
-        response
-            .error_for_status()
-            .with_context(|| format!("s3 delete returned error for {}", target.url))?;
+        if !response.status().is_success() {
+            bail!(
+                "s3 delete returned {} for {}{}",
+                response.status(),
+                target.url,
+                s3_http_status_hint("delete", response.status(), &backend)
+            );
+        }
         report.deleted += 1;
     }
 
@@ -403,6 +413,13 @@ struct S3CacheBackend {
 impl S3CacheBackend {
     fn uses_signed_auth(&self) -> bool {
         matches!(self.auth, ResolvedS3Auth::SigV4(_))
+    }
+
+    fn auth_mode_label(&self) -> &'static str {
+        match self.auth {
+            ResolvedS3Auth::Anonymous => "anonymous",
+            ResolvedS3Auth::SigV4(_) => "sigv4",
+        }
     }
 }
 
@@ -664,9 +681,10 @@ fn fetch_from_s3_cache(
     }
     if !response.status().is_success() {
         bail!(
-            "s3 cache fetch returned {} for {}",
+            "s3 cache fetch returned {} for {}{}",
             response.status(),
-            target.url
+            target.url,
+            s3_http_status_hint("fetch", response.status(), s3_cache)
         );
     }
 
@@ -697,12 +715,35 @@ fn upload_to_s3_cache(
 
     if !response.status().is_success() {
         bail!(
-            "s3 cache upload returned {} for {}",
+            "s3 cache upload returned {} for {}{}",
             response.status(),
-            target.url
+            target.url,
+            s3_http_status_hint("upload", response.status(), s3_cache)
         );
     }
     Ok(())
+}
+
+fn s3_http_status_hint(
+    operation: &str,
+    status: StatusCode,
+    backend: &S3CacheBackend,
+) -> &'static str {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => match backend.auth_mode_label() {
+            "anonymous" => {
+                " (anonymous access denied; configure cache.s3.auth=sigv4 or a public bucket/base URL)"
+            }
+            "sigv4" => {
+                " (signed request rejected; verify cache.s3 endpoint, region, and credentials)"
+            }
+            _ => "",
+        },
+        StatusCode::NOT_FOUND if operation == "upload" => {
+            " (bucket or prefix path is missing on the remote cache target)"
+        }
+        _ => "",
+    }
 }
 
 fn execute_s3_request(
@@ -1513,6 +1554,12 @@ mod hex {
 mod tests {
     use super::*;
     use mineconda_core::{DEFAULT_GROUP_NAME, LoaderKind, LoaderSpec, ModSide};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn sample_package() -> LockedPackage {
         LockedPackage {
@@ -1551,7 +1598,7 @@ mod tests {
             enabled: true,
             bucket: "demo".to_string(),
             region: Some("us-east-1".to_string()),
-            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            endpoint: Some("http://storage.example.test:9000".to_string()),
             public_base_url: None,
             prefix: Some("cache".to_string()),
             path_style: true,
@@ -1589,7 +1636,10 @@ mod tests {
         config.public_base_url = Some("https://cdn.example.com/demo".to_string());
         let target =
             build_s3_object_target(&config, "cache/mod.jar", true).expect("target should build");
-        assert_eq!(target.url, "http://127.0.0.1:9000/demo/cache/mod.jar");
+        assert_eq!(
+            target.url,
+            "http://storage.example.test:9000/demo/cache/mod.jar"
+        );
     }
 
     #[test]
@@ -1599,7 +1649,7 @@ mod tests {
             .expect("list target should build");
         assert_eq!(
             target.url,
-            "http://127.0.0.1:9000/demo?continuation-token=token%2F1&list-type=2&prefix=prune%2Ftest"
+            "http://storage.example.test:9000/demo?continuation-token=token%2F1&list-type=2&prefix=prune%2Ftest"
         );
         assert_eq!(target.canonical_uri, "/demo");
         assert_eq!(
@@ -1622,6 +1672,92 @@ mod tests {
             .expect("backend should configure")
             .expect("backend should exist");
         assert!(matches!(backend.auth, ResolvedS3Auth::Anonymous));
+    }
+
+    #[test]
+    fn auto_auth_uses_sigv4_when_credentials_are_available() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let mut config = sample_s3_config();
+        config.auth = S3CacheAuth::Auto;
+        unsafe {
+            env::set_var("MINECONDA_TEST_ACCESS", "auto-access");
+            env::set_var("MINECONDA_TEST_SECRET", "auto-secret");
+        }
+        let backend = configure_s3_cache_backend(Some(&config))
+            .expect("backend should configure")
+            .expect("backend should exist");
+        assert!(matches!(backend.auth, ResolvedS3Auth::SigV4(_)));
+        unsafe {
+            env::remove_var("MINECONDA_TEST_ACCESS");
+            env::remove_var("MINECONDA_TEST_SECRET");
+        }
+    }
+
+    #[test]
+    fn object_target_supports_virtual_host_endpoint() {
+        let mut config = sample_s3_config();
+        config.path_style = false;
+        let target =
+            build_s3_object_target(&config, "cache/mod.jar", true).expect("target should build");
+        assert_eq!(
+            target.url,
+            "http://demo.storage.example.test:9000/cache/mod.jar"
+        );
+        assert_eq!(target.canonical_uri, "/cache/mod.jar");
+    }
+
+    #[test]
+    fn list_target_supports_virtual_host_endpoint() {
+        let mut config = sample_s3_config();
+        config.path_style = false;
+        let target = build_s3_list_target(&config, Some("prune/test"), Some("next/page"))
+            .expect("list target should build");
+        assert_eq!(
+            target.url,
+            "http://demo.storage.example.test:9000?continuation-token=next%2Fpage&list-type=2&prefix=prune%2Ftest"
+        );
+        assert_eq!(target.canonical_uri, "/");
+    }
+
+    #[test]
+    fn anonymous_fetch_403_reports_auth_hint() {
+        let mut config = sample_s3_config();
+        config.auth = S3CacheAuth::Anonymous;
+        config.public_base_url = Some("https://cdn.example.com/demo".to_string());
+        let backend = configure_s3_cache_backend(Some(&config))
+            .expect("backend should configure")
+            .expect("backend should exist");
+
+        assert!(
+            s3_http_status_hint("fetch", StatusCode::FORBIDDEN, &backend)
+                .contains("anonymous access denied")
+        );
+    }
+
+    #[test]
+    fn signed_upload_403_reports_auth_hint() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let config = sample_s3_config();
+        unsafe {
+            env::set_var("MINECONDA_TEST_ACCESS", "upload-access");
+            env::set_var("MINECONDA_TEST_SECRET", "upload-secret");
+        }
+        let backend = configure_s3_cache_backend(Some(&config))
+            .expect("backend should configure")
+            .expect("backend should exist");
+        assert!(
+            s3_http_status_hint("upload", StatusCode::FORBIDDEN, &backend)
+                .contains("signed request rejected")
+        );
+        assert!(
+            s3_http_status_hint("upload", StatusCode::NOT_FOUND, &backend)
+                .contains("bucket or prefix path is missing")
+        );
+
+        unsafe {
+            env::remove_var("MINECONDA_TEST_ACCESS");
+            env::remove_var("MINECONDA_TEST_SECRET");
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use mineconda_core::{
     http_user_agent,
 };
 use reqwest::StatusCode;
+use reqwest::Url;
 use reqwest::blocking::{Client, Response};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -1342,11 +1343,10 @@ fn build_s3_download_url(config: &S3SourceConfig, key: &str) -> Result<String> {
     if let Some(base) = config.public_base_url.as_deref()
         && !base.trim().is_empty()
     {
-        return Ok(format!(
-            "{}/{}",
-            base.trim().trim_end_matches('/'),
-            encoded_key
-        ));
+        return validate_s3_download_url(
+            format!("{}/{}", base.trim().trim_end_matches('/'), encoded_key),
+            "sources.s3.public_base_url",
+        );
     }
 
     if let Some(endpoint) = config.endpoint.as_deref()
@@ -1354,9 +1354,15 @@ fn build_s3_download_url(config: &S3SourceConfig, key: &str) -> Result<String> {
     {
         let endpoint = endpoint.trim().trim_end_matches('/');
         if config.path_style {
-            return Ok(format!("{endpoint}/{bucket}/{encoded_key}"));
+            return validate_s3_download_url(
+                format!("{endpoint}/{bucket}/{encoded_key}"),
+                "sources.s3.endpoint",
+            );
         }
-        return Ok(s3_virtual_host_url(endpoint, bucket, &encoded_key));
+        return validate_s3_download_url(
+            s3_virtual_host_url(endpoint, bucket, &encoded_key),
+            "sources.s3.endpoint",
+        );
     }
 
     let region = config
@@ -1367,19 +1373,36 @@ fn build_s3_download_url(config: &S3SourceConfig, key: &str) -> Result<String> {
         .unwrap_or("us-east-1");
     if config.path_style {
         if region == "us-east-1" {
-            return Ok(format!("https://s3.amazonaws.com/{bucket}/{encoded_key}"));
+            return validate_s3_download_url(
+                format!("https://s3.amazonaws.com/{bucket}/{encoded_key}"),
+                "sources.s3.region",
+            );
         }
-        return Ok(format!(
-            "https://s3.{region}.amazonaws.com/{bucket}/{encoded_key}"
-        ));
+        return validate_s3_download_url(
+            format!("https://s3.{region}.amazonaws.com/{bucket}/{encoded_key}"),
+            "sources.s3.region",
+        );
     }
 
     if region == "us-east-1" {
-        return Ok(format!("https://{bucket}.s3.amazonaws.com/{encoded_key}"));
+        return validate_s3_download_url(
+            format!("https://{bucket}.s3.amazonaws.com/{encoded_key}"),
+            "sources.s3.region",
+        );
     }
-    Ok(format!(
-        "https://{bucket}.s3.{region}.amazonaws.com/{encoded_key}"
-    ))
+    validate_s3_download_url(
+        format!("https://{bucket}.s3.{region}.amazonaws.com/{encoded_key}"),
+        "sources.s3.region",
+    )
+}
+
+fn validate_s3_download_url(url: String, source: &str) -> Result<String> {
+    let parsed = Url::parse(&url).with_context(|| format!("invalid {source} URL `{url}`"))?;
+    parsed
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .with_context(|| format!("invalid {source} URL `{url}`: missing host"))?;
+    Ok(url)
 }
 
 fn s3_virtual_host_url(endpoint: &str, bucket: &str, encoded_key: &str) -> String {
@@ -3205,6 +3228,41 @@ mod tests {
         assert_eq!(
             url,
             "https://minio.local:9000/mods-bucket/packs/dev/iris.jar"
+        );
+    }
+
+    #[test]
+    fn build_s3_download_url_supports_virtual_host_endpoint() {
+        let config = S3SourceConfig {
+            bucket: "mods-bucket".to_string(),
+            region: None,
+            endpoint: Some("https://minio.local:9000".to_string()),
+            public_base_url: None,
+            key_prefix: None,
+            path_style: false,
+        };
+        let url = build_s3_download_url(&config, "packs/dev/iris.jar").unwrap();
+        assert_eq!(
+            url,
+            "https://mods-bucket.minio.local:9000/packs/dev/iris.jar"
+        );
+    }
+
+    #[test]
+    fn build_s3_download_url_rejects_invalid_public_base_url() {
+        let config = S3SourceConfig {
+            bucket: "mods-bucket".to_string(),
+            region: None,
+            endpoint: None,
+            public_base_url: Some("not a valid url".to_string()),
+            key_prefix: None,
+            path_style: true,
+        };
+        let err = build_s3_download_url(&config, "packs/dev/iris.jar")
+            .expect_err("invalid public base should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid sources.s3.public_base_url URL")
         );
     }
 

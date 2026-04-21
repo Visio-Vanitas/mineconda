@@ -1,4 +1,6 @@
 use crate::*;
+use mineconda_sync::RemotePruneReport;
+
 pub(crate) fn cmd_cache(root: &Path, command: CacheCommands) -> Result<()> {
     match command {
         CacheCommands::Dir => {
@@ -182,14 +184,15 @@ fn cmd_cache_remote_prune(
     dry_run: bool,
 ) -> Result<()> {
     if !s3 {
-        bail!("remote prune currently requires --s3");
+        bail!("cache remote-prune currently supports only experimental S3 backends; pass --s3");
     }
     let manifest = load_manifest(root)?;
     let cache = manifest
         .cache
         .s3
         .as_ref()
-        .context("cache remote-prune requires [cache.s3] in mineconda.toml")?;
+        .context("cache remote-prune --s3 requires [cache.s3] in mineconda.toml")?;
+    validate_experimental_s3_remote_prune_config(cache)?;
     let report = remote_prune_s3_cache(
         cache,
         &RemotePruneRequest {
@@ -197,12 +200,33 @@ fn cmd_cache_remote_prune(
             prefix,
             dry_run,
         },
-    )?;
+    )
+    .context("experimental s3 remote-prune failed")?;
     println!(
-        "remote prune: listed={}, candidates={}, deleted={}, retained={}, dry_run={}",
-        report.listed, report.candidates, report.deleted, report.retained, dry_run
+        "{}",
+        format_experimental_s3_remote_prune_summary(&report, dry_run)
     );
     Ok(())
+}
+
+fn validate_experimental_s3_remote_prune_config(cache: &S3CacheConfig) -> Result<()> {
+    if !cache.enabled {
+        bail!("cache remote-prune --s3 requires [cache.s3] with enabled=true");
+    }
+    if cache.bucket.trim().is_empty() {
+        bail!("cache remote-prune --s3 requires [cache.s3].bucket");
+    }
+    Ok(())
+}
+
+fn format_experimental_s3_remote_prune_summary(
+    report: &RemotePruneReport,
+    dry_run: bool,
+) -> String {
+    format!(
+        "experimental s3 remote-prune: listed={}, candidates={}, deleted={}, retained={}, dry_run={}",
+        report.listed, report.candidates, report.deleted, report.retained, dry_run
+    )
 }
 
 fn expected_cache_paths(lock: Option<&Lockfile>, cache_root: &Path) -> HashSet<PathBuf> {
@@ -215,4 +239,64 @@ fn expected_cache_paths(lock: Option<&Lockfile>, cache_root: &Path) -> HashSet<P
         out.insert(cache_path_for_package_in(cache_root, package));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use mineconda_core::{S3CacheAuth, S3CacheConfig};
+    use mineconda_sync::RemotePruneReport;
+
+    use super::*;
+
+    #[test]
+    fn validate_remote_prune_config_rejects_disabled_or_empty_bucket() {
+        let disabled = S3CacheConfig {
+            enabled: false,
+            bucket: "cache".to_string(),
+            region: None,
+            endpoint: None,
+            public_base_url: None,
+            prefix: None,
+            path_style: false,
+            access_key_env: None,
+            secret_key_env: None,
+            session_token_env: None,
+            auth: S3CacheAuth::Auto,
+            upload_enabled: true,
+        };
+        assert!(
+            validate_experimental_s3_remote_prune_config(&disabled)
+                .expect_err("disabled cache should fail")
+                .to_string()
+                .contains("enabled=true")
+        );
+
+        let empty_bucket = S3CacheConfig {
+            enabled: true,
+            bucket: "   ".to_string(),
+            ..disabled
+        };
+        assert!(
+            validate_experimental_s3_remote_prune_config(&empty_bucket)
+                .expect_err("empty bucket should fail")
+                .to_string()
+                .contains("[cache.s3].bucket")
+        );
+    }
+
+    #[test]
+    fn remote_prune_summary_is_marked_experimental() {
+        let summary = format_experimental_s3_remote_prune_summary(
+            &RemotePruneReport {
+                listed: 4,
+                candidates: 2,
+                deleted: 1,
+                retained: 2,
+            },
+            true,
+        );
+
+        assert!(summary.starts_with("experimental s3 remote-prune:"));
+        assert!(summary.contains("dry_run=true"));
+    }
 }

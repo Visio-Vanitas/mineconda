@@ -1,6 +1,9 @@
 name: experimental-s3-smoke
 
 on:
+  push:
+    branches:
+      - feature/s3-experimental
   workflow_dispatch:
     inputs:
       ssh_target:
@@ -22,11 +25,12 @@ on:
         description: Private cache bucket used by cache.s3 smoke
         required: false
         default: mineconda-cache-smoke
-  schedule:
-    - cron: "0 3 * * *"
-
 permissions:
   contents: read
+
+concurrency:
+  group: experimental-s3-smoke-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   s3-smoke:
@@ -54,6 +58,14 @@ jobs:
 
       - name: Verify CLI Binary
         run: ./target/release/mineconda --help >/dev/null
+
+      - name: Validate Experimental S3 Inputs
+        shell: bash
+        run: |
+          if [[ -z "${MINECONDA_S3_SSH_TARGET}" ]]; then
+            echo "::error title=Missing remote target::Set workflow input ssh_target or repository variable MINECONDA_S3_SSH_TARGET."
+            exit 1
+          fi
 
       - name: Enhanced S3 Smoke
         env:

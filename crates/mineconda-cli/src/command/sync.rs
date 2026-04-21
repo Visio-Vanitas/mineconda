@@ -68,6 +68,9 @@ pub(crate) fn build_sync_report(
     )?;
 
     let mut lines = Vec::new();
+    if let Some(note) = experimental_s3_sync_note(manifest.as_ref(), report.s3_hits) {
+        lines.push(note);
+    }
     if report.lockfile_updated {
         if locked {
             bail!(
@@ -179,6 +182,9 @@ pub(crate) fn build_sync_json_report(
     )?;
 
     let mut messages = Vec::new();
+    if let Some(note) = experimental_s3_sync_note(manifest.as_ref(), report.s3_hits) {
+        messages.push(note);
+    }
     let mut lockfile_updated = false;
     if report.lockfile_updated {
         if locked {
@@ -324,6 +330,10 @@ fn build_sync_check_json_report(
 
     let package_count = filtered.packages.len();
     let installed = package_count.saturating_sub(missing.len());
+    let mut messages = Vec::new();
+    if let Some(note) = experimental_s3_sync_note(manifest, 0) {
+        messages.push(note);
+    }
     if missing.is_empty() {
         return Ok(SyncJsonReport {
             command: "sync",
@@ -344,9 +354,12 @@ fn build_sync_check_json_report(
                 lockfile_updated: false,
             },
             missing_packages: Vec::new(),
-            messages: vec![format!(
-                "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}"
-            )],
+            messages: {
+                messages.push(format!(
+                    "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}"
+                ));
+                messages
+            },
         });
     }
 
@@ -360,10 +373,10 @@ fn build_sync_check_json_report(
             groups: normalized_package_groups(package),
         })
         .collect::<Vec<_>>();
-    let mut messages = vec![format!(
+    messages.push(format!(
         "sync check: missing groups={group_label} installed={installed} missing={} packages={package_count}",
         missing.len()
-    )];
+    ));
     for (package, target) in &missing {
         messages.push(format!(
             "- {} [{}] {} -> {} groups={}",
@@ -453,20 +466,30 @@ pub(crate) fn build_sync_check_report(
     } else {
         format_active_groups(&active_groups)
     };
+    let s3_note = experimental_s3_sync_note(manifest, 0);
 
     if missing.is_empty() {
+        let mut lines = Vec::new();
+        if let Some(note) = s3_note {
+            lines.push(note);
+        }
+        lines.push(format!(
+            "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}"
+        ));
         return Ok(CommandReport {
-            output: format!(
-                "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}\n"
-            ),
+            output: format!("{}\n", lines.join("\n")),
             exit_code: 0,
         });
     }
 
-    let mut lines = vec![format!(
+    let mut lines = Vec::new();
+    if let Some(note) = s3_note {
+        lines.push(note);
+    }
+    lines.push(format!(
         "sync check: missing groups={group_label} installed={installed} missing={} packages={package_count}",
         missing.len()
-    )];
+    ));
     for (package, target) in missing {
         lines.push(format!(
             "- {} [{}] {} -> {} groups={}",
@@ -497,6 +520,29 @@ fn merge_synced_lock_packages(lock: &mut Lockfile, synced: &Lockfile) {
             *package = (*updated).clone();
         }
     }
+}
+
+fn experimental_s3_sync_note(manifest: Option<&Manifest>, s3_hits: usize) -> Option<String> {
+    let manifest = manifest?;
+    let has_s3_source = manifest
+        .mods
+        .iter()
+        .any(|entry| entry.source == ModSource::S3);
+    let has_s3_cache = manifest
+        .cache
+        .s3
+        .as_ref()
+        .is_some_and(|cache| cache.enabled);
+    if !(has_s3_source || has_s3_cache) {
+        return None;
+    }
+
+    let mut note =
+        "sync note: experimental S3 source/cache path is configured; validate it with `mineconda doctor` and the optional remote smoke before relying on it".to_string();
+    if s3_hits > 0 {
+        note.push_str(&format!(" (s3_hits={s3_hits})"));
+    }
+    Some(note)
 }
 
 #[cfg(test)]
@@ -641,6 +687,136 @@ mod tests {
                 .any(|line| line.contains("next: run `mineconda sync`")),
             "messages should suggest running sync: {:?}",
             report.messages
+        );
+    }
+
+    #[test]
+    fn sync_json_report_marks_experimental_s3_usage() {
+        let project = TempProject::new("sync-json-s3-note");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "demo"
+source = "local"
+version = "vendor/demo.jar"
+side = "both"
+
+[cache.s3]
+enabled = true
+bucket = "cache-bucket"
+auth = "auto"
+"#,
+        )
+        .expect("manifest");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let report = build_sync_json_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync json report");
+
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|line| { line.contains("experimental S3 source/cache path is configured") })
+        );
+    }
+
+    #[test]
+    fn sync_json_report_skips_disabled_s3_cache_note() {
+        let project = TempProject::new("sync-json-s3-disabled-note");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest: Manifest = toml::from_str(
+            r#"
+[project]
+name = "pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "demo"
+source = "local"
+version = "vendor/demo.jar"
+side = "both"
+
+[cache.s3]
+enabled = false
+bucket = "cache-bucket"
+auth = "auto"
+"#,
+        )
+        .expect("manifest");
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let report = build_sync_json_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync json report");
+
+        assert!(
+            report
+                .messages
+                .iter()
+                .all(|line| { !line.contains("experimental S3 source/cache path is configured") })
         );
     }
 
