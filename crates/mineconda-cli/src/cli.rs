@@ -538,7 +538,7 @@ pub(crate) fn default_sync_jobs() -> usize {
         .clamp(1, 8)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RunCommandArgs {
     pub(crate) dry_run: bool,
     pub(crate) java: Option<String>,

@@ -1,11 +1,50 @@
 use crate::command::search::to_run_loader_hint;
 use crate::*;
+use mineconda_runner::build_run_plan;
+
 pub(crate) fn cmd_run(
     root: &Path,
     args: RunCommandArgs,
     profiles: &[String],
     workspace: Option<&WorkspaceConfig>,
 ) -> Result<()> {
+    let request = build_run_request(root, args, profiles, workspace)?;
+    run_game_instance(&request)?;
+    Ok(())
+}
+
+pub(crate) fn build_run_report(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<CommandReport> {
+    let request = build_run_request(root, args, profiles, workspace)?;
+    let plan = build_run_plan(&request)?;
+    let mut lines = vec![
+        format!("mode={}", plan.mode.as_str()),
+        format!("instance={}", request.instance_name),
+    ];
+    for launch in &plan.launches {
+        lines.push(format!(
+            "dry-run [{}]: {} {}",
+            launch.role.as_str(),
+            launch.program,
+            launch.args.join(" ")
+        ));
+    }
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 0,
+    })
+}
+
+fn build_run_request(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<RunRequest> {
     let RunCommandArgs {
         dry_run,
         java,
@@ -50,7 +89,7 @@ pub(crate) fn cmd_run(
     } else {
         None
     };
-    let args = if jvm_args.is_empty() {
+    let extra_jvm_args = if jvm_args.is_empty() {
         defaults.jvm_args.clone()
     } else {
         jvm_args
@@ -83,7 +122,7 @@ pub(crate) fn cmd_run(
         java_bin,
         memory: memory.unwrap_or(defaults.memory),
         dry_run,
-        extra_jvm_args: args,
+        extra_jvm_args,
         username,
         instance_name: instance,
         mode,
@@ -92,8 +131,7 @@ pub(crate) fn cmd_run(
         server_launcher_jar,
         package_paths,
     };
-    run_game_instance(&request)?;
-    Ok(())
+    Ok(request)
 }
 
 pub(crate) fn resolve_java_for_run(

@@ -323,6 +323,25 @@ test -f "$PROJECT_ROOT/.mineconda/instances/dev-client/mineconda-smoke-client.tx
 test -f "$PROJECT_ROOT/.mineconda/instances/dev-server/config/mineconda-run-stage.toml"
 test -f "$PROJECT_ROOT/.mineconda/instances/dev-client/config/mineconda-run-stage.toml"
 
+echo "[ci-smoke] workspace run dry-run/actual"
+WORKSPACE_RUN_ROOT="$WORK_ROOT/workspace-run"
+"$BIN" --root "$WORKSPACE_RUN_ROOT" workspace init smoke-ws
+"$BIN" --root "$WORKSPACE_RUN_ROOT" workspace add packs/client
+"$BIN" --root "$WORKSPACE_RUN_ROOT" workspace add packs/server
+"$BIN" --root "$WORKSPACE_RUN_ROOT" --member packs/client init smoke-client --minecraft 1.21.1 --loader neoforge --loader-version 21.1.227
+"$BIN" --root "$WORKSPACE_RUN_ROOT" --member packs/server init smoke-server --minecraft 1.21.1 --loader neoforge --loader-version 21.1.227
+printf 'fake workspace client launcher\n' > "$WORKSPACE_RUN_ROOT/packs/client/.mineconda/dev/neoforge-client-launch.jar"
+printf 'fake workspace client launcher\n' > "$WORKSPACE_RUN_ROOT/packs/server/.mineconda/dev/neoforge-client-launch.jar"
+workspace_run_dry="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members run --dry-run --java java --mode client)"
+printf '%s\n' "$workspace_run_dry"
+printf '%s\n' "$workspace_run_dry" | rg -q 'workspace run: 2 members'
+printf '%s\n' "$workspace_run_dry" | rg -q '==> packs/client'
+printf '%s\n' "$workspace_run_dry" | rg -q '==> packs/server'
+printf '%s\n' "$workspace_run_dry" | rg -q 'dry-run \[client\]:'
+workspace_run_real="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members run --java /usr/bin/true --mode client)"
+printf '%s\n' "$workspace_run_real"
+printf '%s\n' "$workspace_run_real" | rg -q 'workspace summary: ok=2 stale=0 failed=0'
+
 echo "[ci-smoke] remove local-only mod before strict mrpack export"
 "$BIN" --root "$PROJECT_ROOT" remove jei --source local
 "$BIN" --root "$PROJECT_ROOT" remove smoke-probe --source local

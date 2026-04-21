@@ -9,8 +9,9 @@ use crate::build_lock_diff_json_report;
 use crate::build_lock_write_report;
 use crate::build_status_json_report;
 use crate::build_sync_report;
-use crate::cli::{ExportArg, SyncCommandArgs};
+use crate::cli::{ExportArg, RunCommandArgs, SyncCommandArgs};
 use crate::command::import_export::{build_export_report, workspace_member_export_output};
+use crate::command::run::{build_run_report, cmd_run};
 use crate::project::{
     activation_groups_with_profiles, load_manifest, load_workspace_required,
     normalized_profile_names, requested_groups_fallback, workspace_members,
@@ -315,6 +316,73 @@ pub(crate) fn cmd_export_workspace(
     )?)
 }
 
+pub(crate) fn build_workspace_run_report(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+) -> Result<CommandReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let mut counts = WorkspaceBatchCounts::default();
+    let mut reports = Vec::new();
+
+    for member in members {
+        let report = match build_run_report(&member.root, args.clone(), profiles, Some(&workspace))
+        {
+            Ok(report) => report,
+            Err(err) => CommandReport {
+                output: format!("error: {err:#}\n"),
+                exit_code: 1,
+            },
+        };
+        record_workspace_batch_exit(&mut counts, report.exit_code);
+        reports.push(WorkspaceBatchMemberReport {
+            member: member.name,
+            output: report.output,
+        });
+    }
+
+    Ok(render_workspace_batch_report(
+        "workspace run",
+        &reports,
+        counts,
+    ))
+}
+
+pub(crate) fn cmd_run_workspace(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+) -> Result<()> {
+    if args.dry_run {
+        return emit_command_report(build_workspace_run_report(root, args, profiles)?);
+    }
+
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let mut counts = WorkspaceBatchCounts::default();
+
+    println!("workspace run: {} members", members.len());
+    for member in members {
+        println!("==> {}", member.name);
+        match cmd_run(&member.root, args.clone(), profiles, Some(&workspace)) {
+            Ok(()) => record_workspace_batch_exit(&mut counts, 0),
+            Err(err) => {
+                record_workspace_batch_exit(&mut counts, 1);
+                eprintln!("error: {err:#}");
+            }
+        }
+    }
+
+    emit_command_report(CommandReport {
+        output: format!(
+            "workspace summary: ok={} stale={} failed={}\n",
+            counts.ok, counts.stale_or_missing, counts.failed
+        ),
+        exit_code: workspace_batch_exit_code(counts),
+    })
+}
+
 pub(crate) fn cmd_status_workspace(
     root: &Path,
     groups: Vec<String>,
@@ -532,7 +600,7 @@ pub(crate) fn cmd_lock_diff_workspace(
 
 pub(crate) fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
     bail!(
-        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, `sync --check`, and `export`; rerun `{command}` with `--member <path>`"
+        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, `sync --check`, `export`, and `run`; rerun `{command}` with `--member <path>`"
     )
 }
 
@@ -548,6 +616,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::cli::RunModeArg;
     use crate::test_support::{
         TempProject, install_locked_packages, test_manifest, write_local_member_manifest,
         write_lock_for_manifest, write_workspace_fixture,
@@ -559,6 +628,12 @@ mod tests {
         manifest.project.loader.version = "21.1.227".to_string();
         write_manifest(&manifest_path(root), &manifest).expect("rewrite manifest");
         load_manifest(root).expect("reload pinned manifest")
+    }
+
+    fn write_client_launcher(root: &Path) {
+        let dev_root = root.join(".mineconda/dev");
+        fs::create_dir_all(&dev_root).expect("dev root");
+        fs::write(dev_root.join("neoforge-client-launch.jar"), b"launcher").expect("launcher");
     }
 
     #[test]
@@ -870,11 +945,89 @@ mod tests {
     }
 
     #[test]
+    fn workspace_run_report_renders_all_members_dry_run() {
+        let project = TempProject::new("workspace-run");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/server"]);
+
+        let client_root = project.path.join("packs/client");
+        write_local_member_manifest(&client_root, "client-demo");
+        write_client_launcher(&client_root);
+
+        let server_root = project.path.join("packs/server");
+        write_local_member_manifest(&server_root, "server-demo");
+        write_client_launcher(&server_root);
+
+        let report = build_workspace_run_report(
+            &project.path,
+            RunCommandArgs {
+                dry_run: true,
+                java: None,
+                memory: None,
+                jvm_args: Vec::new(),
+                mode: RunModeArg::Client,
+                username: "DevPlayer".to_string(),
+                instance: "dev".to_string(),
+                launcher_jar: None,
+                server_jar: None,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+        )
+        .expect("workspace run report");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("workspace run: 2 members"));
+        assert!(report.output.contains("==> packs/client"));
+        assert!(report.output.contains("==> packs/server"));
+        assert!(report.output.contains("dry-run [client]:"));
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=2 stale=0 failed=0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_run_executes_all_members_sequentially() {
+        let project = TempProject::new("workspace-run-exec");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/server"]);
+
+        let client_root = project.path.join("packs/client");
+        write_local_member_manifest(&client_root, "client-demo");
+        write_client_launcher(&client_root);
+
+        let server_root = project.path.join("packs/server");
+        write_local_member_manifest(&server_root, "server-demo");
+        write_client_launcher(&server_root);
+
+        cmd_run_workspace(
+            &project.path,
+            RunCommandArgs {
+                dry_run: false,
+                java: Some("/usr/bin/true".to_string()),
+                memory: None,
+                jvm_args: Vec::new(),
+                mode: RunModeArg::Client,
+                username: "DevPlayer".to_string(),
+                instance: "dev".to_string(),
+                launcher_jar: None,
+                server_jar: None,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+        )
+        .expect("workspace run should succeed");
+    }
+
+    #[test]
     fn workspace_unsupported_message_keeps_only_remaining_rejections() {
-        let err =
-            workspace_aggregation_not_supported("mineconda run").expect_err("should reject run");
+        let err = workspace_aggregation_not_supported("mineconda import")
+            .expect_err("should reject import");
         let rendered = format!("{err:#}");
-        assert!(rendered.contains("`sync --check`, and `export`"));
-        assert!(rendered.contains("rerun `mineconda run` with `--member <path>`"));
+        assert!(rendered.contains("`export`, and `run`"));
+        assert!(rendered.contains("rerun `mineconda import` with `--member <path>`"));
     }
 }

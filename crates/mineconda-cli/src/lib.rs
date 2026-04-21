@@ -601,27 +601,44 @@ pub fn run() -> Result<()> {
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                workspace_aggregation_not_supported("mineconda run")?;
+                cmd_run_workspace(
+                    &root,
+                    RunCommandArgs {
+                        dry_run,
+                        java,
+                        memory,
+                        jvm_args,
+                        mode,
+                        username,
+                        instance,
+                        launcher_jar,
+                        server_jar,
+                        groups,
+                        all_groups,
+                    },
+                    &scope.profiles,
+                )?
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                cmd_run(
+                    &target.root,
+                    RunCommandArgs {
+                        dry_run,
+                        java,
+                        memory,
+                        jvm_args,
+                        mode,
+                        username,
+                        instance,
+                        launcher_jar,
+                        server_jar,
+                        groups,
+                        all_groups,
+                    },
+                    &scope.profiles,
+                    target.workspace.as_ref(),
+                )?
             }
-            let target = resolve_project_target(&root, &scope)?;
-            cmd_run(
-                &target.root,
-                RunCommandArgs {
-                    dry_run,
-                    java,
-                    memory,
-                    jvm_args,
-                    mode,
-                    username,
-                    instance,
-                    launcher_jar,
-                    server_jar,
-                    groups,
-                    all_groups,
-                },
-                &scope.profiles,
-                target.workspace.as_ref(),
-            )?
         }
         Commands::Export {
             format,
@@ -651,6 +668,10 @@ pub fn run() -> Result<()> {
             side,
             force,
         } => {
+            let workspace = load_workspace_optional(&root)?;
+            if workspace.is_some() && scope.all_members {
+                workspace_aggregation_not_supported("mineconda import")?;
+            }
             let target = resolve_project_target(&root, &scope)?;
             cmd_import(&target.root, input, format, side, force)?
         }

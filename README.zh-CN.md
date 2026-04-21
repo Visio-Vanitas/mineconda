@@ -222,9 +222,9 @@ mineconda --all-members lock diff --json
 
 - 每个 member 仍各自维护 `mineconda.toml` 和 `mineconda.lock`
 - 目前支持 `status` 和 `lock diff` 的 `--all-members` 聚合
-- `lock`、`lock --check`、`sync`、`sync --check`、`export` 现在支持 `--all-members` 聚合
+- `lock`、`lock --check`、`sync`、`sync --check`、`export`、`run` 现在支持 `--all-members` 聚合
 - `--all-members export` 会在目标输出路径旁为每个 member 生成独立产物，并追加稳定的 member 后缀以避免覆盖
-- workspace 级 `run` 仍要求显式 `--member`
+- `--all-members run` 会按 workspace 中的 member 顺序串行执行；`both` 模式仍只在单个 member 内部处理双端
 
 ## JSON 输出
 
