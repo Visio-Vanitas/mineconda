@@ -88,6 +88,7 @@ mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [-
 - `mineconda lock --check`：只校验所选锁定面，不改写 `mineconda.lock`
 - `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
 - `mineconda sync --check`：只校验所选锁定包是否已安装，不改动工作区
+- 在 workspace 根目录下，还支持 `mineconda --all-members lock`、`lock --check`、`sync --check`
 - 两个命令都支持 `--json`，可用于脚本集成，并保持稳定的 `0/2/1` 退出码
 - `mineconda ls --json`、`mineconda tree --json`、`mineconda why <id> --json` 可输出结构化依赖数据
 
@@ -221,7 +222,8 @@ mineconda --all-members lock diff --json
 
 - 每个 member 仍各自维护 `mineconda.toml` 和 `mineconda.lock`
 - 目前支持 `status` 和 `lock diff` 的 `--all-members` 聚合
-- `lock`、`sync` 以及其他 member 级命令仍要求显式 `--member`，`lock --check` / `sync --check` 也不例外
+- `lock`、`lock --check`、`sync --check` 现在支持 `--all-members` 聚合
+- 真正会修改运行态或产物的 workspace 级 `sync/run/export` 仍要求显式 `--member`
 
 ## JSON 输出
 

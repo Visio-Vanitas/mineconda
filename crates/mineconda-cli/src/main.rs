@@ -744,6 +744,13 @@ struct CommandReport {
     exit_code: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LockWriteReport {
+    install: usize,
+    remove: usize,
+    unchanged: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct JsonErrorReport {
     command: &'static str,
@@ -1728,7 +1735,7 @@ fn render_lock_diff_entry(entry: &LockDiffEntry) -> String {
 
 fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
     bail!(
-        "workspace aggregation is currently supported only for `status` and `lock diff`; rerun `{command}` with `--member <path>`"
+        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, and `sync --check`; rerun `{command}` with `--member <path>`"
     )
 }
 
@@ -1945,22 +1952,19 @@ fn main() -> Result<()> {
             None => {
                 let workspace = load_workspace_optional(&root)?;
                 if workspace.is_some() && scope.all_members {
-                    workspace_aggregation_not_supported(if check {
-                        "mineconda lock --check"
-                    } else {
-                        "mineconda lock"
-                    })?;
+                    cmd_lock_workspace(&root, upgrade, check, groups, all_groups, &scope.profiles)?
+                } else {
+                    let target = resolve_project_target(&root, &scope)?;
+                    cmd_lock(
+                        &target.root,
+                        upgrade,
+                        check,
+                        groups,
+                        all_groups,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    )?
                 }
-                let target = resolve_project_target(&root, &scope)?;
-                cmd_lock(
-                    &target.root,
-                    upgrade,
-                    check,
-                    groups,
-                    all_groups,
-                    &scope.profiles,
-                    target.workspace.as_ref(),
-                )?
             }
         },
         Commands::Status {
@@ -2001,28 +2005,42 @@ fn main() -> Result<()> {
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                workspace_aggregation_not_supported(if check {
-                    "mineconda sync --check"
+                if check {
+                    cmd_sync_check_workspace(
+                        &root,
+                        SyncCommandArgs {
+                            prune: !no_prune,
+                            check,
+                            locked: locked || frozen,
+                            offline,
+                            jobs,
+                            verbose_cache,
+                            groups,
+                            all_groups,
+                        },
+                        &scope.profiles,
+                    )?
                 } else {
-                    "mineconda sync"
-                })?;
+                    workspace_aggregation_not_supported("mineconda sync")?;
+                }
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                cmd_sync(
+                    &target.root,
+                    SyncCommandArgs {
+                        prune: !no_prune,
+                        check,
+                        locked: locked || frozen,
+                        offline,
+                        jobs,
+                        verbose_cache,
+                        groups,
+                        all_groups,
+                    },
+                    &scope.profiles,
+                    target.workspace.as_ref(),
+                )?
             }
-            let target = resolve_project_target(&root, &scope)?;
-            cmd_sync(
-                &target.root,
-                SyncCommandArgs {
-                    prune: !no_prune,
-                    check,
-                    locked: locked || frozen,
-                    offline,
-                    jobs,
-                    verbose_cache,
-                    groups,
-                    all_groups,
-                },
-                &scope.profiles,
-                target.workspace.as_ref(),
-            )?
         }
         Commands::Doctor { strict } => cmd_doctor(&root, strict, no_color)?,
         Commands::Run {
@@ -5130,6 +5148,202 @@ struct WorkspaceAggregateJsonReport {
     members: Vec<WorkspaceAggregateMemberJson>,
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceBatchMemberReport {
+    member: String,
+    output: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkspaceBatchCounts {
+    ok: usize,
+    stale_or_missing: usize,
+    failed: usize,
+}
+
+fn record_workspace_batch_exit(counts: &mut WorkspaceBatchCounts, exit_code: i32) {
+    match exit_code {
+        0 => counts.ok += 1,
+        2 => counts.stale_or_missing += 1,
+        _ => counts.failed += 1,
+    }
+}
+
+fn workspace_batch_exit_code(counts: WorkspaceBatchCounts) -> i32 {
+    if counts.failed > 0 {
+        1
+    } else if counts.stale_or_missing > 0 {
+        2
+    } else {
+        0
+    }
+}
+
+fn render_workspace_batch_report(
+    title: &str,
+    members: &[WorkspaceBatchMemberReport],
+    counts: WorkspaceBatchCounts,
+) -> CommandReport {
+    let mut lines = vec![format!("{title}: {} members", members.len())];
+    for member in members {
+        lines.push(format!("==> {}", member.member));
+        let body = member.output.trim_end();
+        if body.is_empty() {
+            lines.push("(no output)".to_string());
+        } else {
+            lines.extend(body.lines().map(|line| line.to_string()));
+        }
+    }
+    lines.push(format!(
+        "workspace summary: ok={} stale={} failed={}",
+        counts.ok, counts.stale_or_missing, counts.failed
+    ));
+    CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: workspace_batch_exit_code(counts),
+    }
+}
+
+fn build_lock_member_report(
+    root: &Path,
+    upgrade: bool,
+    check: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<CommandReport> {
+    let manifest = load_manifest(root)?;
+    if check {
+        return build_lock_check_report(
+            root, &manifest, upgrade, groups, all_groups, profiles, workspace,
+        );
+    }
+
+    let active_groups =
+        activation_groups_with_profiles(&manifest, workspace, &groups, all_groups, profiles)?;
+    Ok(render_lock_write_report(build_lock_write_report(
+        root,
+        &manifest,
+        upgrade,
+        active_groups,
+    )?))
+}
+
+fn build_workspace_lock_report(
+    root: &Path,
+    upgrade: bool,
+    check: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<CommandReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let title = if check {
+        "workspace lock check"
+    } else {
+        "workspace lock"
+    };
+    let mut counts = WorkspaceBatchCounts::default();
+    let mut reports = Vec::new();
+
+    for member in members {
+        let report = match build_lock_member_report(
+            &member.root,
+            upgrade,
+            check,
+            groups.clone(),
+            all_groups,
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(report) => report,
+            Err(err) => CommandReport {
+                output: format!("error: {err:#}\n"),
+                exit_code: 1,
+            },
+        };
+        record_workspace_batch_exit(&mut counts, report.exit_code);
+        reports.push(WorkspaceBatchMemberReport {
+            member: member.name,
+            output: report.output,
+        });
+    }
+
+    Ok(render_workspace_batch_report(title, &reports, counts))
+}
+
+fn cmd_lock_workspace(
+    root: &Path,
+    upgrade: bool,
+    check: bool,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<()> {
+    emit_command_report(build_workspace_lock_report(
+        root, upgrade, check, groups, all_groups, profiles,
+    )?)
+}
+
+fn build_workspace_sync_check_report(
+    root: &Path,
+    args: SyncCommandArgs,
+    profiles: &[String],
+) -> Result<CommandReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let mut counts = WorkspaceBatchCounts::default();
+    let mut reports = Vec::new();
+
+    for member in members {
+        let report = match load_manifest_optional(&member.root) {
+            Ok(manifest) => match build_sync_check_report(
+                &member.root,
+                manifest.as_ref(),
+                SyncCommandArgs {
+                    prune: args.prune,
+                    check: true,
+                    locked: args.locked,
+                    offline: args.offline,
+                    jobs: args.jobs,
+                    verbose_cache: args.verbose_cache,
+                    groups: args.groups.clone(),
+                    all_groups: args.all_groups,
+                },
+                profiles,
+                Some(&workspace),
+            ) {
+                Ok(report) => report,
+                Err(err) => CommandReport {
+                    output: format!("error: {err:#}\n"),
+                    exit_code: 1,
+                },
+            },
+            Err(err) => CommandReport {
+                output: format!("error: {err:#}\n"),
+                exit_code: 1,
+            },
+        };
+        record_workspace_batch_exit(&mut counts, report.exit_code);
+        reports.push(WorkspaceBatchMemberReport {
+            member: member.name,
+            output: report.output,
+        });
+    }
+
+    Ok(render_workspace_batch_report(
+        "workspace sync check",
+        &reports,
+        counts,
+    ))
+}
+
+fn cmd_sync_check_workspace(root: &Path, args: SyncCommandArgs, profiles: &[String]) -> Result<()> {
+    emit_command_report(build_workspace_sync_check_report(root, args, profiles)?)
+}
+
 fn cmd_status_workspace(
     root: &Path,
     groups: Vec<String>,
@@ -6817,12 +7031,12 @@ fn load_lockfile_required(root: &Path) -> Result<Lockfile> {
     load_lockfile_optional(root)?.context("lockfile not found, run `mineconda lock` first")
 }
 
-fn write_lock_from_manifest(
+fn build_lock_write_report(
     root: &Path,
     manifest: &Manifest,
     upgrade: bool,
     groups: BTreeSet<String>,
-) -> Result<()> {
+) -> Result<LockWriteReport> {
     let old_lock = load_lockfile_optional(root)?;
     let output = resolve_lockfile(
         manifest,
@@ -6833,13 +7047,32 @@ fn write_lock_from_manifest(
     write_lockfile(&path, &output.lockfile)
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    println!(
-        "lock updated: install={}, remove={}, unchanged={}",
-        output.plan.install.len(),
-        output.plan.remove.len(),
-        output.plan.unchanged.len()
-    );
-    Ok(())
+    Ok(LockWriteReport {
+        install: output.plan.install.len(),
+        remove: output.plan.remove.len(),
+        unchanged: output.plan.unchanged.len(),
+    })
+}
+
+fn render_lock_write_report(report: LockWriteReport) -> CommandReport {
+    CommandReport {
+        output: format!(
+            "lock updated: install={}, remove={}, unchanged={}\n",
+            report.install, report.remove, report.unchanged
+        ),
+        exit_code: 0,
+    }
+}
+
+fn write_lock_from_manifest(
+    root: &Path,
+    manifest: &Manifest,
+    upgrade: bool,
+    groups: BTreeSet<String>,
+) -> Result<()> {
+    emit_command_report(render_lock_write_report(build_lock_write_report(
+        root, manifest, upgrade, groups,
+    )?))
 }
 
 fn resolve_java_for_run(
@@ -6953,7 +7186,7 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
@@ -6970,11 +7203,12 @@ mod tests {
         Cli, DoctorLevel, LockDiffKind, ProjectSelection, ScopeArgs, SyncCommandArgs,
         TreeCommandArgs, WhyCommandArgs, activation_groups_with_profiles, build_lock_check_report,
         build_lock_diff_json_report, build_status_json_report, build_sync_check_report,
-        build_tree_json_report, build_why_json_report, collect_s3_doctor_findings,
-        compute_lock_diff_entries, display_width, extract_curseforge_project_id,
-        extract_modrinth_slug, lock_package_matches_request, render_forward_dependency_forest,
-        render_lock_diff_entry, render_lock_diff_json_report, render_reverse_dependency_tree,
-        render_status_json_report, render_why_report, resolve_java_for_run, resolve_project_target,
+        build_tree_json_report, build_why_json_report, build_workspace_lock_report,
+        build_workspace_sync_check_report, collect_s3_doctor_findings, compute_lock_diff_entries,
+        display_width, extract_curseforge_project_id, extract_modrinth_slug,
+        lock_package_matches_request, render_forward_dependency_forest, render_lock_diff_entry,
+        render_lock_diff_json_report, render_reverse_dependency_tree, render_status_json_report,
+        render_why_report, resolve_java_for_run, resolve_project_target,
         resolve_search_install_target, truncate_visual, wrap_visual,
     };
 
@@ -7341,6 +7575,57 @@ groups = ["client", "dev"]
     impl Drop for TempProject {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_workspace_fixture(root: &Path, members: &[&str]) {
+        let workspace = WorkspaceConfig {
+            workspace: mineconda_core::WorkspaceSection {
+                name: "demo".to_string(),
+                members: Vec::new(),
+            },
+            members: members.iter().map(|member| (*member).to_string()).collect(),
+            profiles: Default::default(),
+            runtime: None,
+        };
+        write_workspace(&workspace_path(root), &workspace).expect("write workspace");
+        for member in members {
+            fs::create_dir_all(root.join(member)).expect("member dir");
+        }
+    }
+
+    fn write_local_member_manifest(root: &Path, id: &str) -> Manifest {
+        fs::create_dir_all(root.join("vendor")).expect("vendor dir");
+        fs::write(root.join(format!("vendor/{id}.jar")), id.as_bytes()).expect("fixture jar");
+        let manifest = test_manifest(vec![ModSpec::new(
+            id.to_string(),
+            ModSource::Local,
+            format!("vendor/{id}.jar"),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(root), &manifest).expect("write manifest");
+        manifest
+    }
+
+    fn write_lock_for_manifest(root: &Path, manifest: &Manifest) -> Lockfile {
+        let output = resolve_lockfile(
+            manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(root), &output.lockfile).expect("write lock");
+        output.lockfile
+    }
+
+    fn install_locked_packages(root: &Path, lock: &Lockfile) {
+        fs::create_dir_all(root.join("mods")).expect("mods dir");
+        for package in &lock.packages {
+            fs::write(root.join(package.install_path_or_default()), b"installed")
+                .expect("install package");
         }
     }
 
@@ -7925,6 +8210,139 @@ mods = [
         .expect("sync check report");
         assert_eq!(report.exit_code, 0);
         assert!(report.output.contains("sync check: installed"));
+    }
+
+    #[test]
+    fn workspace_lock_report_writes_all_members() {
+        let project = TempProject::new("workspace-lock");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/server"]);
+        let client_root = project.path.join("packs/client");
+        let server_root = project.path.join("packs/server");
+        let client_manifest = write_local_member_manifest(&client_root, "client-demo");
+        let server_manifest = write_local_member_manifest(&server_root, "server-demo");
+
+        let report =
+            build_workspace_lock_report(&project.path, false, false, Vec::new(), false, &[])
+                .expect("workspace lock report");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("workspace lock: 2 members"));
+        assert!(report.output.contains("==> packs/client"));
+        assert!(report.output.contains("==> packs/server"));
+        assert!(lockfile_path(&client_root).exists());
+        assert!(lockfile_path(&server_root).exists());
+
+        let client_lock = super::load_lockfile_required(&client_root).expect("client lock");
+        let server_lock = super::load_lockfile_required(&server_root).expect("server lock");
+        assert_eq!(client_lock.packages.len(), 1);
+        assert_eq!(server_lock.packages.len(), 1);
+        assert_eq!(client_manifest.mods.len(), 1);
+        assert_eq!(server_manifest.mods.len(), 1);
+    }
+
+    #[test]
+    fn workspace_lock_check_report_prioritizes_failures_over_stale() {
+        let project = TempProject::new("workspace-lock-check");
+        write_workspace_fixture(
+            &project.path,
+            &["packs/clean", "packs/stale", "packs/broken"],
+        );
+
+        let clean_root = project.path.join("packs/clean");
+        let clean_manifest = write_local_member_manifest(&clean_root, "clean-demo");
+        write_lock_for_manifest(&clean_root, &clean_manifest);
+
+        let stale_root = project.path.join("packs/stale");
+        let stale_manifest = write_local_member_manifest(&stale_root, "stale-demo");
+        write_lock_for_manifest(&stale_root, &stale_manifest);
+        fs::write(stale_root.join("vendor/stale-extra.jar"), b"extra").expect("extra jar");
+        let updated_manifest = test_manifest(vec![
+            ModSpec::new(
+                "stale-demo".to_string(),
+                ModSource::Local,
+                "vendor/stale-demo.jar".to_string(),
+                ModSide::Both,
+            ),
+            ModSpec::new(
+                "stale-extra".to_string(),
+                ModSource::Local,
+                "vendor/stale-extra.jar".to_string(),
+                ModSide::Both,
+            ),
+        ]);
+        write_manifest(&manifest_path(&stale_root), &updated_manifest).expect("rewrite manifest");
+
+        let broken_root = project.path.join("packs/broken");
+        fs::create_dir_all(&broken_root).expect("broken dir");
+
+        let report =
+            build_workspace_lock_report(&project.path, false, true, Vec::new(), false, &[])
+                .expect("workspace lock check report");
+
+        assert_eq!(report.exit_code, 1);
+        assert!(report.output.contains("workspace lock check: 3 members"));
+        assert!(report.output.contains("lock check: up-to-date"));
+        assert!(report.output.contains("lock check: stale"));
+        assert!(report.output.contains("ADD stale-extra [local]"));
+        assert!(report.output.contains("==> packs/broken"));
+        assert!(report.output.contains("error:"));
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=1 stale=1 failed=1")
+        );
+    }
+
+    #[test]
+    fn workspace_sync_check_report_tracks_ok_missing_and_failed_members() {
+        let project = TempProject::new("workspace-sync-check");
+        write_workspace_fixture(
+            &project.path,
+            &["packs/clean", "packs/missing", "packs/unlocked"],
+        );
+
+        let clean_root = project.path.join("packs/clean");
+        let clean_manifest = write_local_member_manifest(&clean_root, "clean-demo");
+        let clean_lock = write_lock_for_manifest(&clean_root, &clean_manifest);
+        install_locked_packages(&clean_root, &clean_lock);
+
+        let missing_root = project.path.join("packs/missing");
+        let missing_manifest = write_local_member_manifest(&missing_root, "missing-demo");
+        write_lock_for_manifest(&missing_root, &missing_manifest);
+
+        let unlocked_root = project.path.join("packs/unlocked");
+        write_local_member_manifest(&unlocked_root, "unlocked-demo");
+
+        let report = build_workspace_sync_check_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+        )
+        .expect("workspace sync check report");
+
+        assert_eq!(report.exit_code, 1);
+        assert!(report.output.contains("workspace sync check: 3 members"));
+        assert!(report.output.contains("sync check: installed"));
+        assert!(report.output.contains("sync check: missing"));
+        assert!(
+            report
+                .output
+                .contains("lockfile missing; run `mineconda lock` first")
+        );
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=1 stale=1 failed=1")
+        );
     }
 
     #[test]
