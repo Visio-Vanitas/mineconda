@@ -88,8 +88,8 @@ Useful package-state commands:
 - `mineconda lock --check` validates the selected lock surface without rewriting `mineconda.lock`
 - `mineconda status` reports manifest/lock/sync drift for the selected groups
 - `mineconda sync --check` validates whether the selected locked packages are installed without mutating the workspace
-- workspace roots additionally support `mineconda --all-members lock`, `lock --check`, and `sync --check`
-- add `--json` to either command for machine-readable output and stable `0/2/1` exit codes
+- workspace roots additionally support `mineconda --all-members lock`, `lock --check`, `sync`, and `sync --check`
+- `mineconda lock diff --json`, `status --json`, and `sync --json` provide machine-readable output with stable `0/2/1` exit codes
 - `mineconda ls --json`, `mineconda tree --json`, and `mineconda why <id> --json` expose structured package graph data for tooling
 
 ## Dependency Groups
@@ -225,8 +225,9 @@ Current workspace boundary:
 
 - each member keeps its own `mineconda.toml` and `mineconda.lock`
 - `status` and `lock diff` support `--all-members` aggregation
-- `lock`, `lock --check`, `sync`, `sync --check`, `export`, and `run` support `--all-members` aggregation
+- `lock`, `lock --check`, `sync`, `sync --check`, `export`, `import`, and `run` support `--all-members` aggregation
 - `--all-members export` writes one artifact per member next to the requested output path, suffixed with a deterministic member tag to avoid collisions
+- `--all-members import <dir>` expects a directory-mapped layout where each member reads exactly one supported archive from `<dir>/<member-path>/`
 - `--all-members run` executes members sequentially in workspace order; `both` mode remains scoped inside each member run
 
 ## JSON Output
@@ -235,12 +236,18 @@ Machine-readable output is available for:
 
 - `mineconda lock diff --json`
 - `mineconda status --json`
+- `mineconda sync --json`
+- `mineconda export --json`
+- `mineconda import --json`
+- `mineconda run --json`
 - `mineconda ls --json`
 - `mineconda tree --json`
 - `mineconda why <id> --json`
 
-When `--all-members` is used from a workspace root, `status --json` and `lock diff --json`
-return per-member reports with aggregate exit codes.
+When `--all-members` is used from a workspace root, `status --json`, `lock diff --json`,
+`sync --json`, `export --json`, `import --json`, and `run --json` return per-member reports
+with aggregate exit codes. For `run --json`, prefer `--dry-run` if you need clean machine output;
+real launches still inherit child process stdout/stderr.
 
 ## Search UX
 

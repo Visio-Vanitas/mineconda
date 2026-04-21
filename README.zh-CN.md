@@ -88,8 +88,8 @@ mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [-
 - `mineconda lock --check`：只校验所选锁定面，不改写 `mineconda.lock`
 - `mineconda status`：汇总所选 groups 的 manifest / lock / sync 漂移情况
 - `mineconda sync --check`：只校验所选锁定包是否已安装，不改动工作区
-- 在 workspace 根目录下，还支持 `mineconda --all-members lock`、`lock --check`、`sync --check`
-- 两个命令都支持 `--json`，可用于脚本集成，并保持稳定的 `0/2/1` 退出码
+- 在 workspace 根目录下，还支持 `mineconda --all-members lock`、`lock --check`、`sync`、`sync --check`
+- `mineconda lock diff --json`、`status --json`、`sync --json` 可用于脚本集成，并保持稳定的 `0/2/1` 退出码
 - `mineconda ls --json`、`mineconda tree --json`、`mineconda why <id> --json` 可输出结构化依赖数据
 
 ## Dependency Groups
@@ -222,8 +222,9 @@ mineconda --all-members lock diff --json
 
 - 每个 member 仍各自维护 `mineconda.toml` 和 `mineconda.lock`
 - 目前支持 `status` 和 `lock diff` 的 `--all-members` 聚合
-- `lock`、`lock --check`、`sync`、`sync --check`、`export`、`run` 现在支持 `--all-members` 聚合
+- `lock`、`lock --check`、`sync`、`sync --check`、`export`、`import`、`run` 现在支持 `--all-members` 聚合
 - `--all-members export` 会在目标输出路径旁为每个 member 生成独立产物，并追加稳定的 member 后缀以避免覆盖
+- `--all-members import <目录>` 使用目录映射模式：每个 member 从 `<目录>/<member-path>/` 里读取且只读取一个受支持的导入包
 - `--all-members run` 会按 workspace 中的 member 顺序串行执行；`both` 模式仍只在单个 member 内部处理双端
 
 ## JSON 输出
@@ -232,12 +233,17 @@ mineconda --all-members lock diff --json
 
 - `mineconda lock diff --json`
 - `mineconda status --json`
+- `mineconda sync --json`
+- `mineconda export --json`
+- `mineconda import --json`
+- `mineconda run --json`
 - `mineconda ls --json`
 - `mineconda tree --json`
 - `mineconda why <id> --json`
 
-在 workspace 根目录配合 `--all-members` 使用时，`status --json` 和 `lock diff --json`
-会返回按 member 聚合的结果以及对应退出码。
+在 workspace 根目录配合 `--all-members` 使用时，`status --json`、`lock diff --json`、
+`sync --json`、`export --json`、`import --json`、`run --json` 都会返回按 member 聚合的结果以及对应退出码。
+如果你需要干净的机器可读输出，`run --json` 建议配合 `--dry-run` 使用；真实启动时仍会继承子进程的标准输出和标准错误。
 
 ## 搜索交互
 

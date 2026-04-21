@@ -189,6 +189,119 @@ pub(crate) struct StatusJsonReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct RunJsonSummary {
+    pub(crate) exit_code: i32,
+    pub(crate) launches: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RunJsonLaunch {
+    pub(crate) role: String,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RunJsonReport {
+    pub(crate) command: &'static str,
+    pub(crate) groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) profiles: Vec<String>,
+    pub(crate) mode: String,
+    pub(crate) instance: String,
+    pub(crate) dry_run: bool,
+    pub(crate) java: String,
+    pub(crate) memory: String,
+    pub(crate) summary: RunJsonSummary,
+    pub(crate) launches: Vec<RunJsonLaunch>,
+    pub(crate) messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExportJsonSummary {
+    pub(crate) exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExportJsonReport {
+    pub(crate) command: &'static str,
+    pub(crate) groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) profiles: Vec<String>,
+    pub(crate) format: String,
+    pub(crate) output: String,
+    pub(crate) summary: ExportJsonSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compatibility_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_loader_version: Option<String>,
+    pub(crate) messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ImportJsonSummary {
+    pub(crate) exit_code: i32,
+    pub(crate) mods: usize,
+    pub(crate) packages: usize,
+    pub(crate) overrides: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ImportJsonReport {
+    pub(crate) command: &'static str,
+    pub(crate) input: String,
+    pub(crate) detected_format: String,
+    pub(crate) side: String,
+    pub(crate) force: bool,
+    pub(crate) summary: ImportJsonSummary,
+    pub(crate) manifest_path: String,
+    pub(crate) lockfile_path: String,
+    pub(crate) messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SyncJsonSummary {
+    pub(crate) mode: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) exit_code: i32,
+    pub(crate) packages: usize,
+    pub(crate) installed: usize,
+    pub(crate) missing: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) local_hits: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) s3_hits: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) origin_downloads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failed: Option<usize>,
+    pub(crate) lockfile_updated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SyncJsonMissingPackage {
+    pub(crate) id: String,
+    pub(crate) source: String,
+    pub(crate) version: String,
+    pub(crate) target: String,
+    pub(crate) groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SyncJsonReport {
+    pub(crate) command: &'static str,
+    pub(crate) groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) profiles: Vec<String>,
+    pub(crate) summary: SyncJsonSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) missing_packages: Vec<SyncJsonMissingPackage>,
+    pub(crate) messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct LsJsonSummary {
     pub(crate) roots: usize,
 }

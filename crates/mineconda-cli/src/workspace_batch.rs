@@ -1,6 +1,6 @@
 use std::{env, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use mineconda_core::{ModSource, WorkspaceConfig};
 use serde::Serialize;
 
@@ -9,9 +9,14 @@ use crate::build_lock_diff_json_report;
 use crate::build_lock_write_report;
 use crate::build_status_json_report;
 use crate::build_sync_report;
-use crate::cli::{ExportArg, RunCommandArgs, SyncCommandArgs};
-use crate::command::import_export::{build_export_report, workspace_member_export_output};
-use crate::command::run::{build_run_report, cmd_run};
+use crate::cli::{ExportArg, ImportFormatArg, ImportSideArg, RunCommandArgs, SyncCommandArgs};
+use crate::command::import_export::{
+    build_export_json_report, build_export_report, build_import_json_report,
+    build_workspace_member_import_report, resolve_workspace_member_import_archive,
+    workspace_member_export_output,
+};
+use crate::command::run::{build_run_json_report, build_run_report, cmd_run};
+use crate::command::sync::build_sync_json_report;
 use crate::project::{
     activation_groups_with_profiles, load_manifest, load_workspace_required,
     normalized_profile_names, requested_groups_fallback, workspace_members,
@@ -22,7 +27,7 @@ use crate::report::{
 };
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkspaceAggregateSummary {
+pub(crate) struct WorkspaceAggregateSummary {
     members: usize,
     changed: usize,
     failed: usize,
@@ -30,7 +35,7 @@ struct WorkspaceAggregateSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkspaceAggregateMemberJson {
+pub(crate) struct WorkspaceAggregateMemberJson {
     member: String,
     path: String,
     exit_code: i32,
@@ -41,7 +46,7 @@ struct WorkspaceAggregateMemberJson {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct WorkspaceAggregateJsonReport {
+pub(crate) struct WorkspaceAggregateJsonReport {
     command: &'static str,
     workspace: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -106,6 +111,72 @@ fn render_workspace_batch_report(
         output: format!("{}\n", lines.join("\n")),
         exit_code: workspace_batch_exit_code(counts),
     }
+}
+
+fn resolve_workspace_root(root: &Path, action: &str) -> Result<std::path::PathBuf> {
+    if root.is_absolute() {
+        return Ok(root.to_path_buf());
+    }
+
+    Ok(env::current_dir()
+        .with_context(|| format!("failed to read current working directory for {action}"))?
+        .join(root))
+}
+
+fn build_workspace_aggregate_json_report(
+    command: &'static str,
+    workspace: String,
+    groups: Vec<String>,
+    profiles: Vec<String>,
+    members: Vec<WorkspaceAggregateMemberJson>,
+) -> WorkspaceAggregateJsonReport {
+    let mut counts = WorkspaceBatchCounts::default();
+    for member in &members {
+        record_workspace_batch_exit(&mut counts, member.exit_code);
+    }
+    WorkspaceAggregateJsonReport {
+        command,
+        workspace,
+        groups,
+        profiles,
+        summary: WorkspaceAggregateSummary {
+            members: members.len(),
+            changed: counts.stale_or_missing,
+            failed: counts.failed,
+            exit_code: workspace_batch_exit_code(counts),
+        },
+        members,
+    }
+}
+
+fn workspace_member_json_error(
+    member: &str,
+    root: &Path,
+    error: impl Into<String>,
+    exit_code: i32,
+) -> WorkspaceAggregateMemberJson {
+    WorkspaceAggregateMemberJson {
+        member: member.to_string(),
+        path: root.display().to_string(),
+        exit_code,
+        report: None,
+        error: Some(error.into()),
+    }
+}
+
+fn workspace_member_json_report<T: Serialize>(
+    member: &str,
+    root: &Path,
+    exit_code: i32,
+    report: &T,
+) -> Result<WorkspaceAggregateMemberJson> {
+    Ok(WorkspaceAggregateMemberJson {
+        member: member.to_string(),
+        path: root.display().to_string(),
+        exit_code,
+        report: Some(serde_json::to_value(report)?),
+        error: None,
+    })
 }
 
 fn build_lock_member_report(
@@ -242,8 +313,50 @@ pub(crate) fn cmd_sync_workspace(
     root: &Path,
     args: SyncCommandArgs,
     profiles: &[String],
+    json: bool,
 ) -> Result<()> {
+    if json {
+        let report = build_workspace_sync_json_report(root, args, profiles)?;
+        return emit_json_report(&report, report.summary.exit_code);
+    }
     emit_command_report(build_workspace_sync_report(root, args, profiles)?)
+}
+
+pub(crate) fn build_workspace_sync_json_report(
+    root: &Path,
+    args: SyncCommandArgs,
+    profiles: &[String],
+) -> Result<WorkspaceAggregateJsonReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let fallback_groups = requested_groups_fallback(&args.groups, args.all_groups);
+    let normalized_profiles = normalized_profile_names(profiles)?;
+    let mut json_members = Vec::new();
+
+    for member in members {
+        match build_sync_json_report(&member.root, args.clone(), profiles, Some(&workspace)) {
+            Ok(report) => json_members.push(workspace_member_json_report(
+                &member.name,
+                &member.root,
+                report.summary.exit_code,
+                &report,
+            )?),
+            Err(err) => json_members.push(workspace_member_json_error(
+                &member.name,
+                &member.root,
+                format!("{err:#}"),
+                1,
+            )),
+        }
+    }
+
+    Ok(build_workspace_aggregate_json_report(
+        "sync",
+        workspace.workspace.name,
+        fallback_groups,
+        normalized_profiles,
+        json_members,
+    ))
 }
 
 pub(crate) fn build_workspace_export_report(
@@ -256,13 +369,7 @@ pub(crate) fn build_workspace_export_report(
 ) -> Result<CommandReport> {
     let workspace = load_workspace_required(root)?;
     let members = workspace_members(root, &workspace)?;
-    let workspace_root = if root.is_absolute() {
-        root.to_path_buf()
-    } else {
-        env::current_dir()
-            .context("failed to read current working directory for workspace export")?
-            .join(root)
-    };
+    let workspace_root = resolve_workspace_root(root, "workspace export")?;
     let base_output = if output.is_absolute() {
         output
     } else {
@@ -310,10 +417,72 @@ pub(crate) fn cmd_export_workspace(
     groups: Vec<String>,
     all_groups: bool,
     profiles: &[String],
+    json: bool,
 ) -> Result<()> {
+    if json {
+        let report =
+            build_workspace_export_json_report(root, format, output, groups, all_groups, profiles)?;
+        return emit_json_report(&report, report.summary.exit_code);
+    }
     emit_command_report(build_workspace_export_report(
         root, format, output, groups, all_groups, profiles,
     )?)
+}
+
+pub(crate) fn build_workspace_export_json_report(
+    root: &Path,
+    format: ExportArg,
+    output: std::path::PathBuf,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<WorkspaceAggregateJsonReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let workspace_root = resolve_workspace_root(root, "workspace export")?;
+    let base_output = if output.is_absolute() {
+        output
+    } else {
+        workspace_root.join(output)
+    };
+    let fallback_groups = requested_groups_fallback(&groups, all_groups);
+    let normalized_profiles = normalized_profile_names(profiles)?;
+    let mut json_members = Vec::new();
+
+    for (index, member) in members.iter().enumerate() {
+        let member_output =
+            workspace_member_export_output(&base_output, &member.name, index + 1, members.len());
+        match build_export_json_report(
+            &member.root,
+            format,
+            member_output,
+            groups.clone(),
+            all_groups,
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(report) => json_members.push(workspace_member_json_report(
+                &member.name,
+                &member.root,
+                report.summary.exit_code,
+                &report,
+            )?),
+            Err(err) => json_members.push(workspace_member_json_error(
+                &member.name,
+                &member.root,
+                format!("{err:#}"),
+                1,
+            )),
+        }
+    }
+
+    Ok(build_workspace_aggregate_json_report(
+        "export",
+        workspace.workspace.name,
+        fallback_groups,
+        normalized_profiles,
+        json_members,
+    ))
 }
 
 pub(crate) fn build_workspace_run_report(
@@ -353,7 +522,12 @@ pub(crate) fn cmd_run_workspace(
     root: &Path,
     args: RunCommandArgs,
     profiles: &[String],
+    json: bool,
 ) -> Result<()> {
+    if json {
+        let report = build_workspace_run_json_report(root, args, profiles)?;
+        return emit_json_report(&report, report.summary.exit_code);
+    }
     if args.dry_run {
         return emit_command_report(build_workspace_run_report(root, args, profiles)?);
     }
@@ -381,6 +555,190 @@ pub(crate) fn cmd_run_workspace(
         ),
         exit_code: workspace_batch_exit_code(counts),
     })
+}
+
+pub(crate) fn build_workspace_run_json_report(
+    root: &Path,
+    args: RunCommandArgs,
+    profiles: &[String],
+) -> Result<WorkspaceAggregateJsonReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let fallback_groups = requested_groups_fallback(&args.groups, args.all_groups);
+    let normalized_profiles = normalized_profile_names(profiles)?;
+    let mut json_members = Vec::new();
+
+    for member in members {
+        let run_report =
+            build_run_json_report(&member.root, args.clone(), profiles, Some(&workspace));
+        if args.dry_run {
+            match run_report {
+                Ok(report) => json_members.push(workspace_member_json_report(
+                    &member.name,
+                    &member.root,
+                    report.summary.exit_code,
+                    &report,
+                )?),
+                Err(err) => json_members.push(workspace_member_json_error(
+                    &member.name,
+                    &member.root,
+                    format!("{err:#}"),
+                    1,
+                )),
+            }
+            continue;
+        }
+
+        match run_report {
+            Ok(report) => match cmd_run(&member.root, args.clone(), profiles, Some(&workspace)) {
+                Ok(()) => json_members.push(workspace_member_json_report(
+                    &member.name,
+                    &member.root,
+                    0,
+                    &report,
+                )?),
+                Err(err) => json_members.push(workspace_member_json_error(
+                    &member.name,
+                    &member.root,
+                    format!("{err:#}"),
+                    1,
+                )),
+            },
+            Err(err) => json_members.push(workspace_member_json_error(
+                &member.name,
+                &member.root,
+                format!("{err:#}"),
+                1,
+            )),
+        }
+    }
+
+    Ok(build_workspace_aggregate_json_report(
+        "run",
+        workspace.workspace.name,
+        fallback_groups,
+        normalized_profiles,
+        json_members,
+    ))
+}
+
+pub(crate) fn build_workspace_import_report(
+    root: &Path,
+    input: String,
+    format: ImportFormatArg,
+    side: ImportSideArg,
+    force: bool,
+) -> Result<CommandReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let workspace_root = resolve_workspace_root(root, "workspace import")?;
+    let base_input = if Path::new(&input).is_absolute() {
+        std::path::PathBuf::from(&input)
+    } else {
+        workspace_root.join(&input)
+    };
+    let mut counts = WorkspaceBatchCounts::default();
+    let mut reports = Vec::new();
+
+    for member in members {
+        let report = build_workspace_member_import_report(
+            &member.root,
+            &base_input,
+            &member.name,
+            format,
+            side,
+            force,
+        )
+        .unwrap_or_else(|err| CommandReport {
+            output: format!("error: {err:#}\n"),
+            exit_code: 1,
+        });
+        record_workspace_batch_exit(&mut counts, report.exit_code);
+        reports.push(WorkspaceBatchMemberReport {
+            member: member.name,
+            output: report.output,
+        });
+    }
+
+    Ok(render_workspace_batch_report(
+        "workspace import",
+        &reports,
+        counts,
+    ))
+}
+
+pub(crate) fn build_workspace_import_json_report(
+    root: &Path,
+    input: String,
+    format: ImportFormatArg,
+    side: ImportSideArg,
+    force: bool,
+) -> Result<WorkspaceAggregateJsonReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let workspace_root = resolve_workspace_root(root, "workspace import")?;
+    let base_input = if Path::new(&input).is_absolute() {
+        std::path::PathBuf::from(&input)
+    } else {
+        workspace_root.join(&input)
+    };
+    let mut json_members = Vec::new();
+
+    for member in members {
+        match resolve_workspace_member_import_archive(&base_input, &member.name) {
+            Ok(archive) => match build_import_json_report(
+                &member.root,
+                archive.display().to_string(),
+                format,
+                side,
+                force,
+            ) {
+                Ok(report) => json_members.push(workspace_member_json_report(
+                    &member.name,
+                    &member.root,
+                    report.summary.exit_code,
+                    &report,
+                )?),
+                Err(err) => json_members.push(workspace_member_json_error(
+                    &member.name,
+                    &member.root,
+                    format!("{err:#}"),
+                    1,
+                )),
+            },
+            Err(err) => json_members.push(workspace_member_json_error(
+                &member.name,
+                &member.root,
+                format!("{err:#}"),
+                1,
+            )),
+        }
+    }
+
+    Ok(build_workspace_aggregate_json_report(
+        "import",
+        workspace.workspace.name,
+        Vec::new(),
+        Vec::new(),
+        json_members,
+    ))
+}
+
+pub(crate) fn cmd_import_workspace(
+    root: &Path,
+    input: String,
+    format: ImportFormatArg,
+    side: ImportSideArg,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let report = build_workspace_import_json_report(root, input, format, side, force)?;
+        return emit_json_report(&report, report.summary.exit_code);
+    }
+    emit_command_report(build_workspace_import_report(
+        root, input, format, side, force,
+    )?)
 }
 
 pub(crate) fn cmd_status_workspace(
@@ -598,12 +956,6 @@ pub(crate) fn cmd_lock_diff_workspace(
     })
 }
 
-pub(crate) fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
-    bail!(
-        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, `sync --check`, `export`, and `run`; rerun `{command}` with `--member <path>`"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -612,14 +964,17 @@ mod tests {
     };
 
     use mineconda_core::{
-        ModSide, ModSource, ModSpec, lockfile_path, manifest_path, write_manifest,
+        DEFAULT_GROUP_NAME, HashAlgorithm, LockedPackage, ModSide, ModSource, ModSpec, PackageHash,
+        lockfile_path, manifest_path, write_manifest,
     };
+    use mineconda_export::{ExportFormat, ExportRequest, export_pack};
+    use serde_json::Value;
 
     use super::*;
-    use crate::cli::RunModeArg;
+    use crate::cli::{ImportFormatArg, ImportSideArg, RunModeArg};
     use crate::test_support::{
-        TempProject, install_locked_packages, test_manifest, write_local_member_manifest,
-        write_lock_for_manifest, write_workspace_fixture,
+        TempProject, install_locked_packages, test_lockfile, test_manifest,
+        write_local_member_manifest, write_lock_for_manifest, write_workspace_fixture,
     };
     use crate::{load_lockfile_required, load_manifest};
 
@@ -634,6 +989,55 @@ mod tests {
         let dev_root = root.join(".mineconda/dev");
         fs::create_dir_all(&dev_root).expect("dev root");
         fs::write(dev_root.join("neoforge-client-launch.jar"), b"launcher").expect("launcher");
+    }
+
+    fn write_test_mrpack(dir: &Path, file_name: &str) -> std::path::PathBuf {
+        let manifest = test_manifest(vec![ModSpec::new(
+            "jei".to_string(),
+            ModSource::Modrinth,
+            "latest".to_string(),
+            ModSide::Both,
+        )]);
+        let lockfile = test_lockfile(vec![LockedPackage {
+            id: "jei".to_string(),
+            source: ModSource::Modrinth,
+            version: "1.0.0".to_string(),
+            side: ModSide::Both,
+            file_name: "jei.jar".to_string(),
+            install_path: None,
+            file_size: Some(1),
+            sha256: "b".repeat(64),
+            download_url: "https://example.invalid/jei.jar".to_string(),
+            hashes: vec![
+                PackageHash {
+                    algorithm: HashAlgorithm::Sha1,
+                    value: "a".repeat(40),
+                },
+                PackageHash {
+                    algorithm: HashAlgorithm::Sha256,
+                    value: "b".repeat(64),
+                },
+                PackageHash {
+                    algorithm: HashAlgorithm::Sha512,
+                    value: "c".repeat(128),
+                },
+            ],
+            source_ref: Some("requested=jei;project=jei;version=1.0.0;name=jei".to_string()),
+            groups: vec![DEFAULT_GROUP_NAME.to_string()],
+            dependencies: Vec::new(),
+        }]);
+        let output = dir.join(file_name);
+        export_pack(
+            &manifest,
+            &lockfile,
+            &ExportRequest {
+                output: output.clone(),
+                format: ExportFormat::Mrpack,
+                project_root: None,
+            },
+        )
+        .expect("write test mrpack");
+        output
     }
 
     #[test]
@@ -1018,16 +1422,54 @@ mod tests {
                 all_groups: false,
             },
             &[],
+            false,
         )
         .expect("workspace run should succeed");
     }
 
     #[test]
-    fn workspace_unsupported_message_keeps_only_remaining_rejections() {
-        let err = workspace_aggregation_not_supported("mineconda import")
-            .expect_err("should reject import");
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("`export`, and `run`"));
-        assert!(rendered.contains("rerun `mineconda import` with `--member <path>`"));
+    fn workspace_import_json_report_collects_member_results() {
+        let workspace_root = TempProject::new("workspace-import-json");
+        write_workspace_fixture(&workspace_root.path, &["packs/client", "packs/server"]);
+
+        let client_dir = workspace_root.path.join("imports/packs/client");
+        fs::create_dir_all(&client_dir).expect("client import dir");
+        write_test_mrpack(&client_dir, "client-pack.mrpack");
+
+        let server_dir = workspace_root.path.join("imports/packs/server");
+        fs::create_dir_all(&server_dir).expect("server import dir");
+        write_test_mrpack(&server_dir, "server-pack.mrpack");
+
+        let report = build_workspace_import_json_report(
+            &workspace_root.path,
+            "imports".to_string(),
+            ImportFormatArg::Auto,
+            ImportSideArg::Client,
+            false,
+        )
+        .expect("workspace import json report");
+
+        assert_eq!(report.summary.exit_code, 0);
+        assert_eq!(report.summary.members, 2);
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(report.members.len(), 2);
+        for member in &report.members {
+            assert_eq!(member.exit_code, 0);
+            let value: Value = member.report.clone().expect("member report");
+            assert_eq!(value["command"], "import");
+            assert_eq!(value["detected_format"], "modrinth-mrpack");
+        }
+        assert!(
+            workspace_root
+                .path
+                .join("packs/client/mineconda.toml")
+                .exists()
+        );
+        assert!(
+            workspace_root
+                .path
+                .join("packs/server/mineconda.toml")
+                .exists()
+        );
     }
 }

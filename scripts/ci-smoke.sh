@@ -191,6 +191,19 @@ printf '%s\n' "$sync_out" | rg -q 'sync done: packages='
 echo "[ci-smoke] sync --locked"
 "$BIN" --root "$PROJECT_ROOT" sync --locked
 
+echo "[ci-smoke] sync --json"
+sync_json="$("$BIN" --root "$PROJECT_ROOT" sync --check --json)"
+printf '%s\n' "$sync_json"
+JSON_PAYLOAD="$sync_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "sync", payload
+assert payload["summary"]["mode"] == "check", payload
+assert payload["summary"]["exit_code"] == 0, payload
+PY
+
 echo "[ci-smoke] lock diff/status clean"
 lock_diff_clean="$("$BIN" --root "$PROJECT_ROOT" lock diff)"
 printf '%s\n' "$lock_diff_clean"
@@ -258,6 +271,20 @@ both_out="$("$BIN" --root "$PROJECT_ROOT" run --dry-run --java java --mode both)
 printf '%s\n' "$both_out"
 printf '%s\n' "$both_out" | rg -q 'neoforge-server-launch.jar'
 printf '%s\n' "$both_out" | rg -q 'neoforge-client-launch.jar'
+
+echo "[ci-smoke] run --json (dry-run)"
+run_json="$("$BIN" --root "$PROJECT_ROOT" run --dry-run --json --java java --mode both)"
+printf '%s\n' "$run_json"
+JSON_PAYLOAD="$run_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "run", payload
+assert payload["dry_run"] is True, payload
+assert payload["mode"] == "both", payload
+assert payload["summary"]["launches"] == 2, payload
+PY
 
 echo "[ci-smoke] env install/use/list/which"
 if [[ -d "$RUNTIME_SEED_DIR/payload" ]]; then
@@ -342,6 +369,39 @@ workspace_run_real="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members run --ja
 printf '%s\n' "$workspace_run_real"
 printf '%s\n' "$workspace_run_real" | rg -q 'workspace summary: ok=2 stale=0 failed=0'
 
+echo "[ci-smoke] workspace sync/export/run --json"
+"$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members lock >/dev/null
+workspace_sync_json="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members sync --check --json)"
+JSON_PAYLOAD="$workspace_sync_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "sync", payload
+assert payload["summary"]["members"] == 2, payload
+assert payload["summary"]["exit_code"] == 0, payload
+PY
+workspace_run_json="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members run --dry-run --json --java java --mode client)"
+JSON_PAYLOAD="$workspace_run_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "run", payload
+assert payload["summary"]["members"] == 2, payload
+assert len(payload["members"]) == 2, payload
+PY
+workspace_export_json="$("$BIN" --root "$WORKSPACE_RUN_ROOT" --all-members export --format mods-desc --output dist/workspace-mods --json)"
+JSON_PAYLOAD="$workspace_export_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "export", payload
+assert payload["summary"]["members"] == 2, payload
+assert len(payload["members"]) == 2, payload
+PY
+
 echo "[ci-smoke] remove local-only mod before strict mrpack export"
 "$BIN" --root "$PROJECT_ROOT" remove jei --source local
 "$BIN" --root "$PROJECT_ROOT" remove smoke-probe --source local
@@ -368,6 +428,20 @@ if unzip -p "$PROJECT_ROOT/dist/mypack-cf.zip" manifest.json | rg -q '"id":"neof
   echo "[ci-smoke] failed: curseforge loader version must not be latest"
   exit 1
 fi
+
+echo "[ci-smoke] export --json"
+export_json="$("$BIN" --root "$PROJECT_ROOT" export --format mods-desc --output dist/mods-json --json)"
+printf '%s\n' "$export_json"
+JSON_PAYLOAD="$export_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "export", payload
+assert payload["format"] == "mods-desc", payload
+assert payload["summary"]["exit_code"] == 0, payload
+PY
+test -f "$PROJECT_ROOT/dist/mods-json.json"
 
 echo "[ci-smoke] import auto (local/url) + non-mod path sync"
 command -v python3 >/dev/null
@@ -451,6 +525,44 @@ test -f "$IMPORT_LOCAL_ROOT/mods/imported-mod.jar"
 test -f "$IMPORT_LOCAL_ROOT/config/imported/settings.jar"
 test -f "$IMPORT_LOCAL_ROOT/config/from-import.toml"
 test -f "$IMPORT_LOCAL_ROOT/overrides/config/from-import.toml"
+
+echo "[ci-smoke] import --json"
+IMPORT_JSON_ROOT="$WORK_ROOT/import-auto-json"
+import_json="$("$BIN" --root "$IMPORT_JSON_ROOT" import "$IMPORT_SAMPLE" --json)"
+printf '%s\n' "$import_json"
+JSON_PAYLOAD="$import_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "import", payload
+assert payload["detected_format"] == "modrinth-mrpack", payload
+assert payload["summary"]["exit_code"] == 0, payload
+PY
+test -f "$IMPORT_JSON_ROOT/mineconda.toml"
+test -f "$IMPORT_JSON_ROOT/mineconda.lock"
+
+echo "[ci-smoke] workspace import --json"
+WORKSPACE_IMPORT_ROOT="$WORK_ROOT/workspace-import"
+"$BIN" --root "$WORKSPACE_IMPORT_ROOT" workspace init import-ws
+"$BIN" --root "$WORKSPACE_IMPORT_ROOT" workspace add packs/client
+"$BIN" --root "$WORKSPACE_IMPORT_ROOT" workspace add packs/server
+mkdir -p "$WORKSPACE_IMPORT_ROOT/imports/packs/client" "$WORKSPACE_IMPORT_ROOT/imports/packs/server"
+cp "$IMPORT_SAMPLE" "$WORKSPACE_IMPORT_ROOT/imports/packs/client/client-pack.mrpack"
+cp "$IMPORT_SAMPLE" "$WORKSPACE_IMPORT_ROOT/imports/packs/server/server-pack.mrpack"
+workspace_import_json="$("$BIN" --root "$WORKSPACE_IMPORT_ROOT" --all-members import imports --json)"
+printf '%s\n' "$workspace_import_json"
+JSON_PAYLOAD="$workspace_import_json" python3 <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["JSON_PAYLOAD"])
+assert payload["command"] == "import", payload
+assert payload["summary"]["members"] == 2, payload
+assert payload["summary"]["failed"] == 0, payload
+PY
+test -f "$WORKSPACE_IMPORT_ROOT/packs/client/mineconda.toml"
+test -f "$WORKSPACE_IMPORT_ROOT/packs/server/mineconda.toml"
 
 echo "[ci-smoke] import auto rejects unsupported archive"
 INVALID_IMPORT="$WORK_ROOT/import-unsupported.zip"

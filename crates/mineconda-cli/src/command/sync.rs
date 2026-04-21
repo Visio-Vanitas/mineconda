@@ -102,6 +102,140 @@ pub(crate) fn build_sync_report(
     })
 }
 
+pub(crate) fn build_sync_json_report(
+    root: &Path,
+    args: SyncCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<SyncJsonReport> {
+    let SyncCommandArgs {
+        prune,
+        check,
+        locked,
+        offline,
+        jobs,
+        verbose_cache,
+        groups,
+        all_groups,
+    } = args;
+    if jobs == 0 {
+        bail!("sync --jobs must be >= 1");
+    }
+
+    let manifest = load_manifest_optional(root)?;
+    if check {
+        return build_sync_check_json_report(
+            root,
+            manifest.as_ref(),
+            SyncCommandArgs {
+                prune,
+                check,
+                locked,
+                offline,
+                jobs,
+                verbose_cache,
+                groups,
+                all_groups,
+            },
+            profiles,
+            workspace,
+        );
+    }
+
+    let mut lock = load_lockfile_required(root)?;
+    let active_groups = if let Some(manifest) = manifest.as_ref() {
+        let groups =
+            activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
+        ensure_lock_covers_groups(manifest, &lock, &groups)?;
+        groups
+    } else if !groups.is_empty() || all_groups || !profiles.is_empty() {
+        bail!("group/profile filters require a manifest");
+    } else {
+        BTreeSet::new()
+    };
+    let profile_names = normalized_profile_names(profiles)?;
+    let selected_groups = if active_groups.is_empty() {
+        requested_groups_fallback(&groups, all_groups)
+    } else {
+        active_groups.iter().cloned().collect()
+    };
+    let mut sync_lock = if active_groups.is_empty() {
+        lock.clone()
+    } else {
+        filtered_lockfile(&lock, &active_groups)
+    };
+    let report = sync_lockfile(
+        &mut sync_lock,
+        &SyncRequest {
+            project_root: root.to_path_buf(),
+            prune,
+            s3_cache: manifest
+                .as_ref()
+                .and_then(|manifest| manifest.cache.s3.clone()),
+            offline,
+            jobs,
+            verbose_cache,
+        },
+    )?;
+
+    let mut messages = Vec::new();
+    let mut lockfile_updated = false;
+    if report.lockfile_updated {
+        if locked {
+            bail!(
+                "sync would update lockfile metadata in --locked/--frozen mode; run `mineconda sync` without lock guards first"
+            );
+        }
+        if active_groups.is_empty() {
+            lock = sync_lock;
+        } else {
+            merge_synced_lock_packages(&mut lock, &sync_lock);
+        }
+        let path = lockfile_path(root);
+        write_lockfile(&path, &lock)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        messages.push(format!("lockfile metadata updated: {}", path.display()));
+        lockfile_updated = true;
+    }
+
+    messages.push(format!(
+        "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, installed={}, removed={}, failed={}",
+        report.package_count,
+        report.local_hits,
+        report.s3_hits,
+        report.origin_downloads,
+        report.installed,
+        report.removed,
+        report.failed
+    ));
+
+    Ok(SyncJsonReport {
+        command: "sync",
+        groups: selected_groups,
+        profiles: profile_names,
+        summary: SyncJsonSummary {
+            mode: "sync",
+            state: if report.failed > 0 {
+                "partial"
+            } else {
+                "installed"
+            },
+            exit_code: 0,
+            packages: report.package_count,
+            installed: report.installed,
+            missing: 0,
+            local_hits: Some(report.local_hits),
+            s3_hits: Some(report.s3_hits),
+            origin_downloads: Some(report.origin_downloads),
+            removed: Some(report.removed),
+            failed: Some(report.failed),
+            lockfile_updated,
+        },
+        missing_packages: Vec::new(),
+        messages,
+    })
+}
+
 pub(crate) fn cmd_sync(
     root: &Path,
     args: SyncCommandArgs,
@@ -109,6 +243,160 @@ pub(crate) fn cmd_sync(
     workspace: Option<&WorkspaceConfig>,
 ) -> Result<()> {
     emit_command_report(build_sync_report(root, args, profiles, workspace)?)
+}
+
+fn build_sync_check_json_report(
+    root: &Path,
+    manifest: Option<&Manifest>,
+    args: SyncCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<SyncJsonReport> {
+    let SyncCommandArgs {
+        groups, all_groups, ..
+    } = args;
+    let lock_command = format_selection_command("mineconda lock", &groups, all_groups, profiles)?;
+    let sync_command = format_selection_command("mineconda sync", &groups, all_groups, profiles)?;
+    let profile_names = normalized_profile_names(profiles)?;
+    let Some(lock) = load_lockfile_optional(root)? else {
+        return Ok(SyncJsonReport {
+            command: "sync",
+            groups: requested_groups_fallback(&groups, all_groups),
+            profiles: profile_names,
+            summary: SyncJsonSummary {
+                mode: "check",
+                state: "error",
+                exit_code: 1,
+                packages: 0,
+                installed: 0,
+                missing: 0,
+                local_hits: None,
+                s3_hits: None,
+                origin_downloads: None,
+                removed: None,
+                failed: None,
+                lockfile_updated: false,
+            },
+            missing_packages: Vec::new(),
+            messages: vec![format!(
+                "sync check: lockfile missing; run `{lock_command}` first"
+            )],
+        });
+    };
+    let active_groups = if let Some(manifest) = manifest {
+        let groups =
+            activation_groups_with_profiles(manifest, workspace, &groups, all_groups, profiles)?;
+        ensure_lock_covers_groups(manifest, &lock, &groups)?;
+        groups
+    } else if !groups.is_empty() || all_groups || !profiles.is_empty() {
+        bail!("group/profile filters require a manifest");
+    } else {
+        BTreeSet::new()
+    };
+    let group_label = if active_groups.is_empty() {
+        "all-locked".to_string()
+    } else {
+        format_active_groups(&active_groups)
+    };
+    let selected_groups = if active_groups.is_empty() {
+        requested_groups_fallback(&groups, all_groups)
+    } else {
+        active_groups.iter().cloned().collect()
+    };
+
+    let filtered = if active_groups.is_empty() {
+        lock.clone()
+    } else {
+        filtered_lockfile(&lock, &active_groups)
+    };
+    let mut packages: Vec<&LockedPackage> = filtered.packages.iter().collect();
+    packages.sort_by(|left, right| {
+        locked_package_graph_key(left).cmp(&locked_package_graph_key(right))
+    });
+
+    let mut missing = Vec::new();
+    for package in packages {
+        let target = package_install_target_path(root, package);
+        if !target.exists() {
+            missing.push((package, target));
+        }
+    }
+
+    let package_count = filtered.packages.len();
+    let installed = package_count.saturating_sub(missing.len());
+    if missing.is_empty() {
+        return Ok(SyncJsonReport {
+            command: "sync",
+            groups: selected_groups,
+            profiles: profile_names,
+            summary: SyncJsonSummary {
+                mode: "check",
+                state: "installed",
+                exit_code: 0,
+                packages: package_count,
+                installed,
+                missing: 0,
+                local_hits: None,
+                s3_hits: None,
+                origin_downloads: None,
+                removed: None,
+                failed: None,
+                lockfile_updated: false,
+            },
+            missing_packages: Vec::new(),
+            messages: vec![format!(
+                "sync check: installed groups={group_label} installed={installed} missing=0 packages={package_count}"
+            )],
+        });
+    }
+
+    let missing_packages = missing
+        .iter()
+        .map(|(package, target)| SyncJsonMissingPackage {
+            id: package.id.clone(),
+            source: package.source.as_str().to_string(),
+            version: package.version.clone(),
+            target: target.display().to_string(),
+            groups: normalized_package_groups(package),
+        })
+        .collect::<Vec<_>>();
+    let mut messages = vec![format!(
+        "sync check: missing groups={group_label} installed={installed} missing={} packages={package_count}",
+        missing.len()
+    )];
+    for (package, target) in &missing {
+        messages.push(format!(
+            "- {} [{}] {} -> {} groups={}",
+            package.id,
+            package.source.as_str(),
+            package.version,
+            target.display(),
+            format_group_list(&normalized_package_groups(package))
+        ));
+    }
+    messages.push(format!("next: run `{sync_command}`"));
+
+    Ok(SyncJsonReport {
+        command: "sync",
+        groups: selected_groups,
+        profiles: profile_names,
+        summary: SyncJsonSummary {
+            mode: "check",
+            state: "missing",
+            exit_code: 2,
+            packages: package_count,
+            installed,
+            missing: missing_packages.len(),
+            local_hits: None,
+            s3_hits: None,
+            origin_downloads: None,
+            removed: None,
+            failed: None,
+            lockfile_updated: false,
+        },
+        missing_packages,
+        messages,
+    })
 }
 
 pub(crate) fn build_sync_check_report(
@@ -296,6 +584,64 @@ mod tests {
         .expect("sync check report");
         assert_eq!(installed.exit_code, 0);
         assert!(installed.output.contains("sync check: installed"));
+    }
+
+    #[test]
+    fn sync_json_report_describes_missing_packages() {
+        let project = TempProject::new("sync-json-missing");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = crate::test_support::test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let report = build_sync_json_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: true,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync json report");
+
+        assert_eq!(report.summary.mode, "check");
+        assert_eq!(report.summary.state, "missing");
+        assert_eq!(report.summary.exit_code, 2);
+        assert_eq!(report.summary.packages, 1);
+        assert_eq!(report.summary.installed, 0);
+        assert_eq!(report.summary.missing, 1);
+        assert_eq!(report.missing_packages.len(), 1);
+        assert_eq!(report.missing_packages[0].id, "demo");
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|line| line.contains("next: run `mineconda sync`")),
+            "messages should suggest running sync: {:?}",
+            report.messages
+        );
     }
 
     #[test]

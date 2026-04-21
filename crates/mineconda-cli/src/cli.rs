@@ -197,6 +197,8 @@ pub(crate) enum Commands {
         #[arg(long)]
         check: bool,
         #[arg(long)]
+        json: bool,
+        #[arg(long)]
         locked: bool,
         #[arg(long)]
         frozen: bool,
@@ -218,6 +220,8 @@ pub(crate) enum Commands {
     Run {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        json: bool,
         #[arg(long)]
         java: Option<String>,
         #[arg(long)]
@@ -242,6 +246,8 @@ pub(crate) enum Commands {
     Export {
         #[arg(long, value_enum, default_value_t = ExportArg::Mrpack)]
         format: ExportArg,
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = "dist/modpack")]
         output: PathBuf,
         #[arg(long = "group")]
@@ -253,6 +259,8 @@ pub(crate) enum Commands {
         input: String,
         #[arg(long, value_enum, default_value_t = ImportFormatArg::Auto)]
         format: ImportFormatArg,
+        #[arg(long)]
+        json: bool,
         #[arg(long, value_enum, default_value_t = ImportSideArg::Client)]
         side: ImportSideArg,
         #[arg(long)]
@@ -647,8 +655,16 @@ mod tests {
             }
         ));
 
-        let cli = Cli::try_parse_from(["mineconda", "sync", "--check"]).expect("sync check parse");
-        assert!(matches!(cli.command, Commands::Sync { check: true, .. }));
+        let cli =
+            Cli::try_parse_from(["mineconda", "sync", "--check", "--json"]).expect("sync parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Sync {
+                check: true,
+                json: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -693,5 +709,16 @@ mod tests {
                 command: ProfileCommands::Add { .. }
             }
         ));
+
+        let cli =
+            Cli::try_parse_from(["mineconda", "run", "--dry-run", "--json"]).expect("run json");
+        assert!(matches!(cli.command, Commands::Run { json: true, .. }));
+
+        let cli = Cli::try_parse_from(["mineconda", "export", "--json"]).expect("export json");
+        assert!(matches!(cli.command, Commands::Export { json: true, .. }));
+
+        let cli = Cli::try_parse_from(["mineconda", "import", "sample.mrpack", "--json"])
+            .expect("import json");
+        assert!(matches!(cli.command, Commands::Import { json: true, .. }));
     }
 }

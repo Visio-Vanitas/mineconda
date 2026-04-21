@@ -52,22 +52,25 @@ use crate::cli::*;
 use crate::command::cache::cmd_cache;
 use crate::command::doctor::cmd_doctor;
 use crate::command::env::cmd_env;
-use crate::command::import_export::{cmd_export, cmd_import, package_install_target_path};
+use crate::command::import_export::{
+    build_export_json_report, build_import_json_report, cmd_export, cmd_import,
+    package_install_target_path,
+};
 use crate::command::lock::{
     build_lock_check_report, build_lock_diff_json_report, build_lock_write_report, cmd_lock,
-    cmd_lock_diff, render_status_json_report,
+    cmd_lock_diff, json_error_report, render_status_json_report,
 };
 use crate::command::mods::{
     cmd_add, cmd_group, cmd_init, cmd_ls, cmd_pin, cmd_profile, cmd_remove, cmd_update,
     cmd_workspace, lock_package_matches_request, lock_package_matches_spec,
 };
-use crate::command::run::cmd_run;
+use crate::command::run::{build_run_json_report, cmd_run};
 use crate::command::search::{
     SearchSpinner, cmd_search, format_bytes, format_supported_side, loader_label, optional_value,
     paint, truncate_visual, wrap_visual,
 };
 use crate::command::status::{build_status_json_report, cmd_status};
-use crate::command::sync::{build_sync_report, cmd_sync};
+use crate::command::sync::{build_sync_json_report, build_sync_report, cmd_sync};
 use crate::command::tree_why::{cmd_tree, cmd_why, lock_graph_key, locked_package_graph_key};
 use crate::project::*;
 use crate::report::*;
@@ -542,6 +545,7 @@ pub fn run() -> Result<()> {
         Commands::Sync {
             no_prune,
             check,
+            json,
             locked,
             frozen,
             offline,
@@ -565,29 +569,52 @@ pub fn run() -> Result<()> {
                         all_groups,
                     },
                     &scope.profiles,
+                    json,
                 )?
             } else {
                 let target = resolve_project_target(&root, &scope)?;
-                cmd_sync(
-                    &target.root,
-                    SyncCommandArgs {
-                        prune: !no_prune,
-                        check,
-                        locked: locked || frozen,
-                        offline,
-                        jobs,
-                        verbose_cache,
-                        groups,
-                        all_groups,
-                    },
-                    &scope.profiles,
-                    target.workspace.as_ref(),
-                )?
+                let args = SyncCommandArgs {
+                    prune: !no_prune,
+                    check,
+                    locked: locked || frozen,
+                    offline,
+                    jobs,
+                    verbose_cache,
+                    groups: groups.clone(),
+                    all_groups,
+                };
+                if json {
+                    match build_sync_json_report(
+                        &target.root,
+                        args,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    ) {
+                        Ok(report) => emit_json_report(&report, report.summary.exit_code)?,
+                        Err(err) => emit_json_report(
+                            &json_error_report(
+                                "sync",
+                                requested_groups_fallback(&groups, all_groups),
+                                format!("{err:#}"),
+                                1,
+                            ),
+                            1,
+                        )?,
+                    }
+                } else {
+                    cmd_sync(
+                        &target.root,
+                        args,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    )?
+                }
             }
         }
         Commands::Doctor { strict } => cmd_doctor(&root, strict, no_color)?,
         Commands::Run {
             dry_run,
+            json,
             java,
             memory,
             jvm_args,
@@ -617,63 +644,151 @@ pub fn run() -> Result<()> {
                         all_groups,
                     },
                     &scope.profiles,
+                    json,
                 )?
             } else {
                 let target = resolve_project_target(&root, &scope)?;
-                cmd_run(
-                    &target.root,
-                    RunCommandArgs {
-                        dry_run,
-                        java,
-                        memory,
-                        jvm_args,
-                        mode,
-                        username,
-                        instance,
-                        launcher_jar,
-                        server_jar,
-                        groups,
-                        all_groups,
-                    },
-                    &scope.profiles,
-                    target.workspace.as_ref(),
-                )?
+                let args = RunCommandArgs {
+                    dry_run,
+                    java,
+                    memory,
+                    jvm_args,
+                    mode,
+                    username,
+                    instance,
+                    launcher_jar,
+                    server_jar,
+                    groups: groups.clone(),
+                    all_groups,
+                };
+                if json {
+                    match build_run_json_report(
+                        &target.root,
+                        args.clone(),
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    ) {
+                        Ok(report) => {
+                            if args.dry_run {
+                                emit_json_report(&report, report.summary.exit_code)?
+                            } else {
+                                match cmd_run(
+                                    &target.root,
+                                    args,
+                                    &scope.profiles,
+                                    target.workspace.as_ref(),
+                                ) {
+                                    Ok(()) => emit_json_report(&report, report.summary.exit_code)?,
+                                    Err(err) => emit_json_report(
+                                        &json_error_report(
+                                            "run",
+                                            requested_groups_fallback(&groups, all_groups),
+                                            format!("{err:#}"),
+                                            1,
+                                        ),
+                                        1,
+                                    )?,
+                                }
+                            }
+                        }
+                        Err(err) => emit_json_report(
+                            &json_error_report(
+                                "run",
+                                requested_groups_fallback(&groups, all_groups),
+                                format!("{err:#}"),
+                                1,
+                            ),
+                            1,
+                        )?,
+                    }
+                } else {
+                    cmd_run(
+                        &target.root,
+                        args,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    )?
+                }
             }
         }
         Commands::Export {
             format,
+            json,
             output,
             groups,
             all_groups,
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                cmd_export_workspace(&root, format, output, groups, all_groups, &scope.profiles)?
-            } else {
-                let target = resolve_project_target(&root, &scope)?;
-                cmd_export(
-                    &target.root,
+                cmd_export_workspace(
+                    &root,
                     format,
                     output,
                     groups,
                     all_groups,
                     &scope.profiles,
-                    target.workspace.as_ref(),
+                    json,
                 )?
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                if json {
+                    match build_export_json_report(
+                        &target.root,
+                        format,
+                        output,
+                        groups.clone(),
+                        all_groups,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    ) {
+                        Ok(report) => emit_json_report(&report, report.summary.exit_code)?,
+                        Err(err) => emit_json_report(
+                            &json_error_report(
+                                "export",
+                                requested_groups_fallback(&groups, all_groups),
+                                format!("{err:#}"),
+                                1,
+                            ),
+                            1,
+                        )?,
+                    }
+                } else {
+                    cmd_export(
+                        &target.root,
+                        format,
+                        output,
+                        groups,
+                        all_groups,
+                        &scope.profiles,
+                        target.workspace.as_ref(),
+                    )?
+                }
             }
         }
         Commands::Import {
             input,
             format,
+            json,
             side,
             force,
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                workspace_aggregation_not_supported("mineconda import")?;
+                cmd_import_workspace(&root, input, format, side, force, json)?;
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                if json {
+                    match build_import_json_report(&target.root, input, format, side, force) {
+                        Ok(report) => emit_json_report(&report, report.summary.exit_code)?,
+                        Err(err) => emit_json_report(
+                            &json_error_report("import", Vec::new(), format!("{err:#}"), 1),
+                            1,
+                        )?,
+                    }
+                } else {
+                    cmd_import(&target.root, input, format, side, force)?
+                }
             }
-            let target = resolve_project_target(&root, &scope)?;
-            cmd_import(&target.root, input, format, side, force)?
         }
     }
 
