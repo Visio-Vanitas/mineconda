@@ -1,10 +1,10 @@
 use crate::*;
-pub(crate) fn cmd_sync(
+pub(crate) fn build_sync_report(
     root: &Path,
     args: SyncCommandArgs,
     profiles: &[String],
     workspace: Option<&WorkspaceConfig>,
-) -> Result<()> {
+) -> Result<CommandReport> {
     let SyncCommandArgs {
         prune,
         check,
@@ -20,7 +20,7 @@ pub(crate) fn cmd_sync(
     }
     let manifest = load_manifest_optional(root)?;
     if check {
-        return emit_command_report(build_sync_check_report(
+        return build_sync_check_report(
             root,
             manifest.as_ref(),
             SyncCommandArgs {
@@ -35,7 +35,7 @@ pub(crate) fn cmd_sync(
             },
             profiles,
             workspace,
-        )?);
+        );
     }
     let mut lock = load_lockfile_required(root)?;
     let active_groups = if let Some(manifest) = manifest.as_ref() {
@@ -67,6 +67,7 @@ pub(crate) fn cmd_sync(
         },
     )?;
 
+    let mut lines = Vec::new();
     if report.lockfile_updated {
         if locked {
             bail!(
@@ -81,10 +82,10 @@ pub(crate) fn cmd_sync(
         let path = lockfile_path(root);
         write_lockfile(&path, &lock)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("lockfile metadata updated: {}", path.display());
+        lines.push(format!("lockfile metadata updated: {}", path.display()));
     }
 
-    println!(
+    lines.push(format!(
         "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, installed={}, removed={}, failed={}",
         report.package_count,
         report.local_hits,
@@ -93,8 +94,21 @@ pub(crate) fn cmd_sync(
         report.installed,
         report.removed,
         report.failed
-    );
-    Ok(())
+    ));
+
+    Ok(CommandReport {
+        output: format!("{}\n", lines.join("\n")),
+        exit_code: 0,
+    })
+}
+
+pub(crate) fn cmd_sync(
+    root: &Path,
+    args: SyncCommandArgs,
+    profiles: &[String],
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<()> {
+    emit_command_report(build_sync_report(root, args, profiles, workspace)?)
 }
 
 pub(crate) fn build_sync_check_report(
@@ -356,5 +370,52 @@ mods = [
         .expect("sync check report");
         assert_eq!(report.exit_code, 0);
         assert!(report.output.contains("sync check: installed"));
+    }
+
+    #[test]
+    fn sync_report_installs_local_packages_and_updates_lockfile() {
+        let project = TempProject::new("sync-report-install");
+        fs::create_dir_all(project.path.join("vendor")).expect("vendor dir");
+        fs::write(project.path.join("vendor/demo.jar"), b"demo").expect("fixture jar");
+        let manifest = crate::test_support::test_manifest(vec![ModSpec::new(
+            "demo".to_string(),
+            ModSource::Local,
+            "vendor/demo.jar".to_string(),
+            ModSide::Both,
+        )]);
+        write_manifest(&manifest_path(&project.path), &manifest).expect("write manifest");
+        let output = resolve_lockfile(
+            &manifest,
+            None,
+            &ResolveRequest {
+                upgrade: false,
+                groups: BTreeSet::from([DEFAULT_GROUP_NAME.to_string()]),
+            },
+        )
+        .expect("resolve lock");
+        write_lockfile(&lockfile_path(&project.path), &output.lockfile).expect("write lock");
+
+        let report = build_sync_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: false,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+            None,
+        )
+        .expect("sync report");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("sync done: packages=1"));
+        assert!(project.path.join("mods/demo.jar").exists());
+        let updated_lock = load_lockfile_required(&project.path).expect("updated lock");
+        assert_eq!(updated_lock.packages.len(), 1);
     }
 }

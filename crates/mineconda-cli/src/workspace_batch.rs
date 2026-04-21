@@ -8,12 +8,11 @@ use crate::build_lock_check_report;
 use crate::build_lock_diff_json_report;
 use crate::build_lock_write_report;
 use crate::build_status_json_report;
-use crate::build_sync_check_report;
+use crate::build_sync_report;
 use crate::cli::SyncCommandArgs;
 use crate::project::{
-    activation_groups_with_profiles, load_manifest, load_manifest_optional,
-    load_workspace_required, normalized_profile_names, requested_groups_fallback,
-    workspace_members,
+    activation_groups_with_profiles, load_manifest, load_workspace_required,
+    normalized_profile_names, requested_groups_fallback, workspace_members,
 };
 use crate::report::{
     CommandReport, LockDiffEntry, LockDiffKind, emit_command_report, emit_json_report,
@@ -190,40 +189,38 @@ pub(crate) fn cmd_lock_workspace(
     )?)
 }
 
-pub(crate) fn build_workspace_sync_check_report(
+pub(crate) fn build_workspace_sync_report(
     root: &Path,
     args: SyncCommandArgs,
     profiles: &[String],
 ) -> Result<CommandReport> {
     let workspace = load_workspace_required(root)?;
     let members = workspace_members(root, &workspace)?;
+    let title = if args.check {
+        "workspace sync check"
+    } else {
+        "workspace sync"
+    };
     let mut counts = WorkspaceBatchCounts::default();
     let mut reports = Vec::new();
 
     for member in members {
-        let report = match load_manifest_optional(&member.root) {
-            Ok(manifest) => match build_sync_check_report(
-                &member.root,
-                manifest.as_ref(),
-                SyncCommandArgs {
-                    prune: args.prune,
-                    check: true,
-                    locked: args.locked,
-                    offline: args.offline,
-                    jobs: args.jobs,
-                    verbose_cache: args.verbose_cache,
-                    groups: args.groups.clone(),
-                    all_groups: args.all_groups,
-                },
-                profiles,
-                Some(&workspace),
-            ) {
-                Ok(report) => report,
-                Err(err) => CommandReport {
-                    output: format!("error: {err:#}\n"),
-                    exit_code: 1,
-                },
+        let report = match build_sync_report(
+            &member.root,
+            SyncCommandArgs {
+                prune: args.prune,
+                check: args.check,
+                locked: args.locked,
+                offline: args.offline,
+                jobs: args.jobs,
+                verbose_cache: args.verbose_cache,
+                groups: args.groups.clone(),
+                all_groups: args.all_groups,
             },
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(report) => report,
             Err(err) => CommandReport {
                 output: format!("error: {err:#}\n"),
                 exit_code: 1,
@@ -236,19 +233,15 @@ pub(crate) fn build_workspace_sync_check_report(
         });
     }
 
-    Ok(render_workspace_batch_report(
-        "workspace sync check",
-        &reports,
-        counts,
-    ))
+    Ok(render_workspace_batch_report(title, &reports, counts))
 }
 
-pub(crate) fn cmd_sync_check_workspace(
+pub(crate) fn cmd_sync_workspace(
     root: &Path,
     args: SyncCommandArgs,
     profiles: &[String],
 ) -> Result<()> {
-    emit_command_report(build_workspace_sync_check_report(root, args, profiles)?)
+    emit_command_report(build_workspace_sync_report(root, args, profiles)?)
 }
 
 pub(crate) fn cmd_status_workspace(
@@ -468,7 +461,7 @@ pub(crate) fn cmd_lock_diff_workspace(
 
 pub(crate) fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
     bail!(
-        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, and `sync --check`; rerun `{command}` with `--member <path>`"
+        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, and `sync --check`; rerun `{command}` with `--member <path>`"
     )
 }
 
@@ -588,7 +581,7 @@ mod tests {
         let unlocked_root = project.path.join("packs/unlocked");
         write_local_member_manifest(&unlocked_root, "unlocked-demo");
 
-        let report = build_workspace_sync_check_report(
+        let report = build_workspace_sync_report(
             &project.path,
             SyncCommandArgs {
                 prune: true,
@@ -618,5 +611,57 @@ mod tests {
                 .output
                 .contains("workspace summary: ok=1 stale=1 failed=1")
         );
+    }
+
+    #[test]
+    fn workspace_sync_report_installs_all_members() {
+        let project = TempProject::new("workspace-sync");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/server"]);
+
+        let client_root = project.path.join("packs/client");
+        let client_manifest = write_local_member_manifest(&client_root, "client-demo");
+        write_lock_for_manifest(&client_root, &client_manifest);
+
+        let server_root = project.path.join("packs/server");
+        let server_manifest = write_local_member_manifest(&server_root, "server-demo");
+        write_lock_for_manifest(&server_root, &server_manifest);
+
+        let report = build_workspace_sync_report(
+            &project.path,
+            SyncCommandArgs {
+                prune: true,
+                check: false,
+                locked: false,
+                offline: false,
+                jobs: 1,
+                verbose_cache: false,
+                groups: Vec::new(),
+                all_groups: false,
+            },
+            &[],
+        )
+        .expect("workspace sync report");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("workspace sync: 2 members"));
+        assert!(report.output.contains("==> packs/client"));
+        assert!(report.output.contains("==> packs/server"));
+        assert!(report.output.contains("sync done: packages=1"));
+        assert!(client_root.join("mods/client-demo.jar").exists());
+        assert!(server_root.join("mods/server-demo.jar").exists());
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=2 stale=0 failed=0")
+        );
+    }
+
+    #[test]
+    fn workspace_unsupported_message_keeps_only_remaining_rejections() {
+        let err =
+            workspace_aggregation_not_supported("mineconda run").expect_err("should reject run");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("`sync`, and `sync --check`"));
+        assert!(rendered.contains("rerun `mineconda run` with `--member <path>`"));
     }
 }

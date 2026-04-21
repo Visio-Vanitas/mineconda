@@ -67,7 +67,7 @@ use crate::command::search::{
     paint, truncate_visual, wrap_visual,
 };
 use crate::command::status::{build_status_json_report, cmd_status};
-use crate::command::sync::{build_sync_check_report, cmd_sync};
+use crate::command::sync::{build_sync_report, cmd_sync};
 use crate::command::tree_why::{cmd_tree, cmd_why, lock_graph_key, locked_package_graph_key};
 use crate::project::*;
 use crate::report::*;
@@ -552,24 +552,20 @@ pub fn run() -> Result<()> {
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                if check {
-                    cmd_sync_check_workspace(
-                        &root,
-                        SyncCommandArgs {
-                            prune: !no_prune,
-                            check,
-                            locked: locked || frozen,
-                            offline,
-                            jobs,
-                            verbose_cache,
-                            groups,
-                            all_groups,
-                        },
-                        &scope.profiles,
-                    )?
-                } else {
-                    workspace_aggregation_not_supported("mineconda sync")?;
-                }
+                cmd_sync_workspace(
+                    &root,
+                    SyncCommandArgs {
+                        prune: !no_prune,
+                        check,
+                        locked: locked || frozen,
+                        offline,
+                        jobs,
+                        verbose_cache,
+                        groups,
+                        all_groups,
+                    },
+                    &scope.profiles,
+                )?
             } else {
                 let target = resolve_project_target(&root, &scope)?;
                 cmd_sync(
@@ -603,6 +599,10 @@ pub fn run() -> Result<()> {
             groups,
             all_groups,
         } => {
+            let workspace = load_workspace_optional(&root)?;
+            if workspace.is_some() && scope.all_members {
+                workspace_aggregation_not_supported("mineconda run")?;
+            }
             let target = resolve_project_target(&root, &scope)?;
             cmd_run(
                 &target.root,
@@ -629,6 +629,10 @@ pub fn run() -> Result<()> {
             groups,
             all_groups,
         } => {
+            let workspace = load_workspace_optional(&root)?;
+            if workspace.is_some() && scope.all_members {
+                workspace_aggregation_not_supported("mineconda export")?;
+            }
             let target = resolve_project_target(&root, &scope)?;
             cmd_export(
                 &target.root,
