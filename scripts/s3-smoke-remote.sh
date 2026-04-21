@@ -9,18 +9,36 @@ fi
 BIN="$1"
 PROJECT_ROOT="$2"
 
-SSH_TARGET="${MINECONDA_S3_SSH_TARGET:-wsl}"
+SSH_TARGET="${MINECONDA_S3_SSH_TARGET:-}"
 REMOTE_PORT="${MINECONDA_S3_REMOTE_PORT:-19000}"
 LOCAL_PORT="${MINECONDA_S3_LOCAL_PORT:-39000}"
 SOURCE_BUCKET="${MINECONDA_S3_SOURCE_BUCKET:-${MINECONDA_S3_BUCKET:-mineconda-source-smoke}}"
 CACHE_BUCKET="${MINECONDA_S3_CACHE_BUCKET:-mineconda-cache-smoke}"
 SOURCE_OBJECT_KEY="${MINECONDA_S3_OBJECT_KEY:-packs/dev/iris-s3.jar}"
 PRUNE_OBJECT_KEY="${MINECONDA_S3_PRUNE_OBJECT_KEY:-prune-test/old-probe.jar}"
-ACCESS_KEY="${MINECONDA_S3_ACCESS_KEY:-minioadmin}"
-SECRET_KEY="${MINECONDA_S3_SECRET_KEY:-minioadmin}"
-SUDO_PASSWORD="${MINECONDA_S3_SUDO_PASSWORD:-}"
+REMOTE_PRIVILEGE_SECRET="${MINECONDA_S3_REMOTE_PRIVILEGE_SECRET:-}"
 REMOTE_WORKDIR="${MINECONDA_S3_REMOTE_WORKDIR:-/tmp/mineconda-s3-smoke}"
 CONTAINER="${MINECONDA_S3_CONTAINER:-mineconda-s3-smoke}"
+
+random_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+    return 0
+  fi
+
+  python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+}
+
+if [[ -z "$SSH_TARGET" ]]; then
+  echo "MINECONDA_S3_SSH_TARGET is required for experimental s3 smoke" >&2
+  exit 2
+fi
+
+ACCESS_KEY="${MINECONDA_S3_ACCESS_KEY:-mineconda-$(random_token | cut -c1-16)}"
+SECRET_KEY="${MINECONDA_S3_SECRET_KEY:-$(random_token)}"
 
 export MINECONDA_S3_CACHE_ACCESS_KEY="$ACCESS_KEY"
 export MINECONDA_S3_CACHE_SECRET_KEY="$SECRET_KEY"
@@ -45,13 +63,13 @@ EOF
 }
 trap cleanup EXIT
 
-echo "[s3-smoke] deploy minio on ${SSH_TARGET}"
+echo "[s3-smoke] deploy experimental s3 service on remote target"
 ssh -o BatchMode=yes "$SSH_TARGET" \
   CONTAINER="$CONTAINER" \
   REMOTE_PORT="$REMOTE_PORT" \
   ACCESS_KEY="$ACCESS_KEY" \
   SECRET_KEY="$SECRET_KEY" \
-  SUDO_PASSWORD="$SUDO_PASSWORD" \
+  REMOTE_PRIVILEGE_SECRET="$REMOTE_PRIVILEGE_SECRET" \
   REMOTE_WORKDIR="$REMOTE_WORKDIR" \
   SOURCE_BUCKET="$SOURCE_BUCKET" \
   CACHE_BUCKET="$CACHE_BUCKET" \
@@ -66,8 +84,8 @@ DOCKER_AUTH_MODE="direct"
 if ! docker info >/dev/null 2>&1; then
   if sudo -n docker info >/dev/null 2>&1; then
     DOCKER_AUTH_MODE="sudo-n"
-  elif [[ -n "${SUDO_PASSWORD}" ]] \
-    && printf '%s\n' "${SUDO_PASSWORD}" | sudo -S -p '' docker info >/dev/null 2>&1; then
+  elif [[ -n "${REMOTE_PRIVILEGE_SECRET}" ]] \
+    && printf '%s\n' "${REMOTE_PRIVILEGE_SECRET}" | sudo -S -p '' docker info >/dev/null 2>&1; then
     DOCKER_AUTH_MODE="sudo-password"
   else
     echo "docker is unavailable for current user and sudo docker access failed" >&2
@@ -79,7 +97,7 @@ docker_cmd() {
   if [[ "$DOCKER_AUTH_MODE" == "sudo-n" ]]; then
     sudo -n docker "$@"
   elif [[ "$DOCKER_AUTH_MODE" == "sudo-password" ]]; then
-    printf '%s\n' "${SUDO_PASSWORD}" | sudo -S -p '' docker "$@"
+    printf '%s\n' "${REMOTE_PRIVILEGE_SECRET}" | sudo -S -p '' docker "$@"
   else
     docker "$@"
   fi
@@ -94,7 +112,7 @@ rm_dir() {
   if [[ "$DOCKER_AUTH_MODE" == "sudo-n" ]]; then
     sudo -n rm -rf "$target"
   elif [[ "$DOCKER_AUTH_MODE" == "sudo-password" ]]; then
-    printf '%s\n' "${SUDO_PASSWORD}" | sudo -S -p '' rm -rf "$target"
+    printf '%s\n' "${REMOTE_PRIVILEGE_SECRET}" | sudo -S -p '' rm -rf "$target"
   else
     rm -rf "$target"
   fi
@@ -143,7 +161,7 @@ docker_cmd run --rm --network host \
   quay.io/minio/mc anonymous set public "local/${SOURCE_BUCKET}" >/dev/null
 EOF
 
-echo "[s3-smoke] open ssh tunnel 127.0.0.1:${LOCAL_PORT} -> ${SSH_TARGET}:127.0.0.1:${REMOTE_PORT}"
+echo "[s3-smoke] open local tunnel to experimental s3 service"
 ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N \
   -L "${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}" \
   "$SSH_TARGET" >/dev/null 2>&1 &

@@ -634,8 +634,8 @@ if [[ ! -f "$PROJECT_ROOT/vendor/jei.jar" ]]; then
 fi
 
 if [[ "${MINECONDA_ENABLE_S3_SMOKE:-0}" == "1" ]]; then
-  echo "[ci-smoke] s3 smoke via ssh+wsl (optional)"
-  "$ROOT_DIR/scripts/s3-smoke-wsl.sh" "$BIN" "$PROJECT_ROOT"
+  echo "[ci-smoke] experimental s3 smoke via remote target (optional)"
+  "$ROOT_DIR/scripts/s3-smoke-remote.sh" "$BIN" "$PROJECT_ROOT"
 else
   echo "[ci-smoke] skip optional s3 smoke (set MINECONDA_ENABLE_S3_SMOKE=1 to enable)"
 fi

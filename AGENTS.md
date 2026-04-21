@@ -49,7 +49,8 @@ Optional enhanced S3 validation:
 
 ```bash
 MINECONDA_ENABLE_S3_SMOKE=1 \
-MINECONDA_S3_SUDO_PASSWORD='<sudo-password>' \
+MINECONDA_S3_REMOTE_PRIVILEGE_SECRET='<remote-privilege-secret>' \
+MINECONDA_S3_SSH_TARGET='<remote-ssh-target>' \
 MINECONDA_BIN="$(pwd)/target/release/mineconda" \
 bash scripts/ci-smoke.sh
 ```
@@ -71,7 +72,7 @@ CI workflow:
 - `sync --jobs 2 --verbose-cache` install path and cache source output
 - `cache stats` / `cache verify` local cache observability
 - warmed-cache `sync --offline` restore path
-- optional `source=s3` + private `cache.s3(auth=sigv4)` + `cache remote-prune --s3` smoke via SSH+WSL MinIO (`MINECONDA_ENABLE_S3_SMOKE=1`)
+- optional `source=s3` + private `cache.s3(auth=sigv4)` + `cache remote-prune --s3` smoke via remote experimental S3 target (`MINECONDA_ENABLE_S3_SMOKE=1`)
 - `env install/use/list/which` managed Java runtime path
 - `doctor` managed runtime path plus non-blocking experimental S3 diagnostics
 - `ls --status --info`, `update`, `pin`, `cache` command chain
@@ -100,7 +101,14 @@ Smoke workspace:
 - before merge, run full pipeline in order (fmt -> clippy -> test -> smoke)
 - avoid relying on external APIs in baseline smoke checks
 - keep `clippy -D warnings` clean (current standard)
-- optional WSL S3 smoke entry: `scripts/s3-smoke-wsl.sh`
+- remove or generalize any detail that could expose the maintainer's local or test environment before committing or pushing:
+  - host aliases
+  - machine-specific paths
+  - runner labels
+  - fixed local credentials
+  - internal network addresses
+  - environment-specific log wording
+- optional remote S3 smoke entry: `scripts/s3-smoke-remote.sh`
 - real NeoForge server smoke entry: `scripts/actual-neoforge-server-smoke.sh`
 - S3 smoke is local/self-hosted only; CI baseline does not inject S3 smoke env
 - treat S3 as experimental in user-facing behavior and diagnostics unless explicitly validating that path
