@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::{env, path::Path};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use mineconda_core::{ModSource, WorkspaceConfig};
 use serde::Serialize;
 
@@ -9,7 +9,8 @@ use crate::build_lock_diff_json_report;
 use crate::build_lock_write_report;
 use crate::build_status_json_report;
 use crate::build_sync_report;
-use crate::cli::SyncCommandArgs;
+use crate::cli::{ExportArg, SyncCommandArgs};
+use crate::command::import_export::{build_export_report, workspace_member_export_output};
 use crate::project::{
     activation_groups_with_profiles, load_manifest, load_workspace_required,
     normalized_profile_names, requested_groups_fallback, workspace_members,
@@ -244,6 +245,76 @@ pub(crate) fn cmd_sync_workspace(
     emit_command_report(build_workspace_sync_report(root, args, profiles)?)
 }
 
+pub(crate) fn build_workspace_export_report(
+    root: &Path,
+    format: ExportArg,
+    output: std::path::PathBuf,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<CommandReport> {
+    let workspace = load_workspace_required(root)?;
+    let members = workspace_members(root, &workspace)?;
+    let workspace_root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to read current working directory for workspace export")?
+            .join(root)
+    };
+    let base_output = if output.is_absolute() {
+        output
+    } else {
+        workspace_root.join(output)
+    };
+    let mut counts = WorkspaceBatchCounts::default();
+    let mut reports = Vec::new();
+
+    for (index, member) in members.iter().enumerate() {
+        let member_output =
+            workspace_member_export_output(&base_output, &member.name, index + 1, members.len());
+        let report = match build_export_report(
+            &member.root,
+            format,
+            member_output,
+            groups.clone(),
+            all_groups,
+            profiles,
+            Some(&workspace),
+        ) {
+            Ok(report) => report,
+            Err(err) => CommandReport {
+                output: format!("error: {err:#}\n"),
+                exit_code: 1,
+            },
+        };
+        record_workspace_batch_exit(&mut counts, report.exit_code);
+        reports.push(WorkspaceBatchMemberReport {
+            member: member.name.clone(),
+            output: report.output,
+        });
+    }
+
+    Ok(render_workspace_batch_report(
+        "workspace export",
+        &reports,
+        counts,
+    ))
+}
+
+pub(crate) fn cmd_export_workspace(
+    root: &Path,
+    format: ExportArg,
+    output: std::path::PathBuf,
+    groups: Vec<String>,
+    all_groups: bool,
+    profiles: &[String],
+) -> Result<()> {
+    emit_command_report(build_workspace_export_report(
+        root, format, output, groups, all_groups, profiles,
+    )?)
+}
+
 pub(crate) fn cmd_status_workspace(
     root: &Path,
     groups: Vec<String>,
@@ -461,24 +532,34 @@ pub(crate) fn cmd_lock_diff_workspace(
 
 pub(crate) fn workspace_aggregation_not_supported(command: &str) -> Result<()> {
     bail!(
-        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, and `sync --check`; rerun `{command}` with `--member <path>`"
+        "workspace aggregation is currently supported only for `status`, `lock diff`, `lock`, `lock --check`, `sync`, `sync --check`, and `export`; rerun `{command}` with `--member <path>`"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use mineconda_core::{
         ModSide, ModSource, ModSpec, lockfile_path, manifest_path, write_manifest,
     };
 
     use super::*;
-    use crate::load_lockfile_required;
     use crate::test_support::{
         TempProject, install_locked_packages, test_manifest, write_local_member_manifest,
         write_lock_for_manifest, write_workspace_fixture,
     };
+    use crate::{load_lockfile_required, load_manifest};
+
+    fn write_pinned_local_member_manifest(root: &Path, id: &str) -> mineconda_core::Manifest {
+        let mut manifest = write_local_member_manifest(root, id);
+        manifest.project.loader.version = "21.1.227".to_string();
+        write_manifest(&manifest_path(root), &manifest).expect("rewrite manifest");
+        load_manifest(root).expect("reload pinned manifest")
+    }
 
     #[test]
     fn workspace_lock_report_writes_all_members() {
@@ -657,11 +738,143 @@ mod tests {
     }
 
     #[test]
+    fn workspace_export_report_writes_distinct_member_artifacts() {
+        let project = TempProject::new("workspace-export");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/server"]);
+
+        let client_root = project.path.join("packs/client");
+        let client_manifest = write_pinned_local_member_manifest(&client_root, "client-demo");
+        write_lock_for_manifest(&client_root, &client_manifest);
+
+        let server_root = project.path.join("packs/server");
+        let server_manifest = write_pinned_local_member_manifest(&server_root, "server-demo");
+        write_lock_for_manifest(&server_root, &server_manifest);
+
+        let report = build_workspace_export_report(
+            &project.path,
+            ExportArg::ModsDesc,
+            "dist/modpack".into(),
+            Vec::new(),
+            false,
+            &[],
+        )
+        .expect("workspace export report");
+
+        let client_export = project.path.join("dist/modpack-1-packs-client.json");
+        let server_export = project.path.join("dist/modpack-2-packs-server.json");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(report.output.contains("workspace export: 2 members"));
+        assert!(
+            report
+                .output
+                .contains(client_export.display().to_string().as_str())
+        );
+        assert!(
+            report
+                .output
+                .contains(server_export.display().to_string().as_str())
+        );
+        assert!(client_export.exists());
+        assert!(server_export.exists());
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=2 stale=0 failed=0")
+        );
+    }
+
+    #[test]
+    fn workspace_export_report_records_member_failures() {
+        let project = TempProject::new("workspace-export-fail");
+        write_workspace_fixture(&project.path, &["packs/client", "packs/unlocked"]);
+
+        let client_root = project.path.join("packs/client");
+        let client_manifest = write_pinned_local_member_manifest(&client_root, "client-demo");
+        write_lock_for_manifest(&client_root, &client_manifest);
+
+        let unlocked_root = project.path.join("packs/unlocked");
+        write_pinned_local_member_manifest(&unlocked_root, "unlocked-demo");
+
+        let report = build_workspace_export_report(
+            &project.path,
+            ExportArg::ModsDesc,
+            "dist/modpack".into(),
+            Vec::new(),
+            false,
+            &[],
+        )
+        .expect("workspace export report");
+
+        assert_eq!(report.exit_code, 1);
+        assert!(report.output.contains("workspace export: 2 members"));
+        assert!(report.output.contains("==> packs/unlocked"));
+        assert!(
+            report
+                .output
+                .contains("error: lockfile not found, run `mineconda lock` first")
+        );
+        assert!(
+            report
+                .output
+                .contains("workspace summary: ok=1 stale=0 failed=1")
+        );
+    }
+
+    #[test]
+    fn workspace_export_report_resolves_relative_output_from_workspace_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::path::PathBuf::from(format!(
+            "target/workspace-export-relative-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("workspace dir");
+        write_workspace_fixture(&root, &["packs/client", "packs/server"]);
+
+        let client_root = root.join("packs/client");
+        let client_manifest = write_pinned_local_member_manifest(&client_root, "client-demo");
+        write_lock_for_manifest(&client_root, &client_manifest);
+
+        let server_root = root.join("packs/server");
+        let server_manifest = write_pinned_local_member_manifest(&server_root, "server-demo");
+        write_lock_for_manifest(&server_root, &server_manifest);
+
+        let report = build_workspace_export_report(
+            &root,
+            ExportArg::ModsDesc,
+            "dist/modpack".into(),
+            Vec::new(),
+            false,
+            &[],
+        )
+        .expect("workspace export report");
+
+        assert_eq!(report.exit_code, 0);
+        assert!(root.join("dist/modpack-1-packs-client.json").exists());
+        assert!(root.join("dist/modpack-2-packs-server.json").exists());
+        assert!(
+            !client_root
+                .join("dist/modpack-1-packs-client.json")
+                .exists()
+        );
+        assert!(
+            !server_root
+                .join("dist/modpack-2-packs-server.json")
+                .exists()
+        );
+
+        fs::remove_dir_all(&root).expect("cleanup relative workspace fixture");
+    }
+
+    #[test]
     fn workspace_unsupported_message_keeps_only_remaining_rejections() {
         let err =
             workspace_aggregation_not_supported("mineconda run").expect_err("should reject run");
         let rendered = format!("{err:#}");
-        assert!(rendered.contains("`sync`, and `sync --check`"));
+        assert!(rendered.contains("`sync --check`, and `export`"));
         assert!(rendered.contains("rerun `mineconda run` with `--member <path>`"));
     }
 }

@@ -225,8 +225,9 @@ Current workspace boundary:
 
 - each member keeps its own `mineconda.toml` and `mineconda.lock`
 - `status` and `lock diff` support `--all-members` aggregation
-- `lock`, `lock --check`, and `sync --check` support `--all-members` aggregation
-- mutating workspace-wide sync/run/export still require explicit `--member`
+- `lock`, `lock --check`, `sync`, `sync --check`, and `export` support `--all-members` aggregation
+- `--all-members export` writes one artifact per member next to the requested output path, suffixed with a deterministic member tag to avoid collisions
+- workspace-wide `run` still requires explicit `--member`
 
 ## JSON Output
 

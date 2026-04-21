@@ -631,18 +631,19 @@ pub fn run() -> Result<()> {
         } => {
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
-                workspace_aggregation_not_supported("mineconda export")?;
+                cmd_export_workspace(&root, format, output, groups, all_groups, &scope.profiles)?
+            } else {
+                let target = resolve_project_target(&root, &scope)?;
+                cmd_export(
+                    &target.root,
+                    format,
+                    output,
+                    groups,
+                    all_groups,
+                    &scope.profiles,
+                    target.workspace.as_ref(),
+                )?
             }
-            let target = resolve_project_target(&root, &scope)?;
-            cmd_export(
-                &target.root,
-                format,
-                output,
-                groups,
-                all_groups,
-                &scope.profiles,
-                target.workspace.as_ref(),
-            )?
         }
         Commands::Import {
             input,
