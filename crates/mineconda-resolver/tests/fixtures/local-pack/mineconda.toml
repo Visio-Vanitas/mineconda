@@ -1,0 +1,29 @@
+[project]
+name = "fixture-local-pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "iris"
+source = "local"
+version = "vendor/iris.jar"
+side = "client"
+
+[[mods]]
+id = "jei"
+source = "local"
+version = "vendor/jei.jar"
+side = "both"
+
+[server]
+java = "java"
+memory = "4G"
+jvm_args = []
+
+[runtime]
+java = "21"
+provider = "temurin"
+auto_install = true

@@ -1,0 +1,29 @@
+{
+  "author": "mineconda",
+  "files": [
+    {
+      "fileID": 5940240,
+      "projectID": 325492,
+      "required": true
+    }
+  ],
+  "manifestType": "minecraftModpack",
+  "manifestVersion": 1,
+  "minecraft": {
+    "modLoaders": [
+      {
+        "id": "neoforge-latest",
+        "primary": true
+      }
+    ],
+    "version": "1.21.1"
+  },
+  "name": "fixture-export-pack",
+  "overrides": "overrides",
+  "version": "0.1.0",
+  "x-mineconda": {
+    "skipped_non_curseforge_entries": [
+      "broken-cf@not-numeric (missing numeric project/file id)"
+    ]
+  }
+}

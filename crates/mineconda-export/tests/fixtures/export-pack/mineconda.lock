@@ -1,0 +1,81 @@
+[metadata]
+generated_by = "mineconda/0.1.0"
+generated_at_unix = 0
+minecraft = "1.21.1"
+
+[metadata.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[packages]]
+id = "sk9rgfiA"
+source = "modrinth"
+version = "1.0.15+mc1.21.1"
+side = "client"
+file_name = "embeddium-1.0.15+mc1.21.1.jar"
+file_size = 1048745
+sha256 = "3aac4c4c6e82d78d8dda4c611d68c672d1061b42bb6954331e3c2e7f14c451e1"
+download_url = "https://cdn.modrinth.com/data/sk9rgfiA/versions/J7b96IEd/embeddium-1.0.15%2Bmc1.21.1.jar"
+source_ref = "project=sk9rgfiA;version=J7b96IEd;name=[1.21.1] Embeddium 1.0.15"
+
+[[packages.hashes]]
+algorithm = "sha1"
+value = "56063839172a000d079272794bad366f2ad4cbbd"
+
+[[packages.hashes]]
+algorithm = "sha512"
+value = "d073cf52dcf2aeec3ac9f746d4571c7b4b1ad746fa11d4bcc5a21a264ae3119ac6d341d08cc9a70042cf0ddffc3b3ef3329ed30217035d4551c9d6788b6dc1e6"
+
+[[packages.hashes]]
+algorithm = "sha256"
+value = "3aac4c4c6e82d78d8dda4c611d68c672d1061b42bb6954331e3c2e7f14c451e1"
+
+[[packages]]
+id = "325492"
+source = "curseforge"
+version = "5940240"
+side = "both"
+file_name = "ranged-pumps-1.2.0-forge-1.21.1.jar"
+file_size = 112233
+sha256 = "cfsha256"
+download_url = "https://media.forgecdn.net/files/5940/240/ranged-pumps-1.2.0-forge-1.21.1.jar"
+source_ref = "mod=325492;file=5940240"
+
+[[packages.hashes]]
+algorithm = "sha1"
+value = "cfsha1"
+
+[[packages.hashes]]
+algorithm = "sha512"
+value = "cfsha512"
+
+[[packages.hashes]]
+algorithm = "md5"
+value = "cfmd5"
+
+[[packages.hashes]]
+algorithm = "sha256"
+value = "cfsha256"
+
+[[packages]]
+id = "broken-cf"
+source = "curseforge"
+version = "not-numeric"
+side = "server"
+file_name = "broken-cf.jar"
+file_size = 998877
+sha256 = "broken-sha256"
+download_url = "https://media.forgecdn.net/files/1/2/broken-cf.jar"
+source_ref = "mod=broken-cf;file=not-numeric"
+
+[[packages.hashes]]
+algorithm = "sha1"
+value = "broken-sha1"
+
+[[packages.hashes]]
+algorithm = "sha512"
+value = "broken-sha512"
+
+[[packages.hashes]]
+algorithm = "sha256"
+value = "broken-sha256"

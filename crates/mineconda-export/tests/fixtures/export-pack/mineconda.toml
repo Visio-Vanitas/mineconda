@@ -1,0 +1,35 @@
+[project]
+name = "fixture-export-pack"
+minecraft = "1.21.1"
+
+[project.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[mods]]
+id = "embeddium"
+source = "modrinth"
+version = "latest"
+side = "client"
+
+[[mods]]
+id = "325492"
+source = "curseforge"
+version = "5940240"
+side = "both"
+
+[[mods]]
+id = "broken-cf"
+source = "curseforge"
+version = "latest"
+side = "server"
+
+[server]
+java = "java"
+memory = "4G"
+jvm_args = []
+
+[runtime]
+java = "21"
+provider = "temurin"
+auto_install = true

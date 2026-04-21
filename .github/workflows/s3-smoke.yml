@@ -1,0 +1,64 @@
+name: s3-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_target:
+        description: SSH target or alias for the MinIO host
+        required: false
+        default: wsl
+      remote_port:
+        description: Remote MinIO port
+        required: false
+        default: "19000"
+      local_port:
+        description: Local forwarded port
+        required: false
+        default: "39000"
+      source_bucket:
+        description: Public source bucket used by sources.s3 smoke
+        required: false
+        default: mineconda-source-smoke
+      cache_bucket:
+        description: Private cache bucket used by cache.s3 smoke
+        required: false
+        default: mineconda-cache-smoke
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  s3-smoke:
+    name: release-s3-smoke
+    runs-on: self-hosted
+    timeout-minutes: 45
+    env:
+      MINECONDA_S3_SSH_TARGET: ${{ inputs.ssh_target || vars.MINECONDA_S3_SSH_TARGET || 'wsl' }}
+      MINECONDA_S3_REMOTE_PORT: ${{ inputs.remote_port || vars.MINECONDA_S3_REMOTE_PORT || '19000' }}
+      MINECONDA_S3_LOCAL_PORT: ${{ inputs.local_port || vars.MINECONDA_S3_LOCAL_PORT || '39000' }}
+      MINECONDA_S3_SOURCE_BUCKET: ${{ inputs.source_bucket || vars.MINECONDA_S3_SOURCE_BUCKET || 'mineconda-source-smoke' }}
+      MINECONDA_S3_CACHE_BUCKET: ${{ inputs.cache_bucket || vars.MINECONDA_S3_CACHE_BUCKET || 'mineconda-cache-smoke' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI Binary
+        run: cargo build -p mineconda-cli --release
+
+      - name: Verify CLI Binary
+        run: ./target/release/mineconda --help >/dev/null
+
+      - name: Enhanced S3 Smoke
+        env:
+          MINECONDA_BIN: ${{ github.workspace }}/target/release/mineconda
+          MINECONDA_ENABLE_S3_SMOKE: "1"
+          MINECONDA_S3_SUDO_PASSWORD: ${{ secrets.MINECONDA_S3_SUDO_PASSWORD }}
+        run: bash scripts/ci-smoke.sh

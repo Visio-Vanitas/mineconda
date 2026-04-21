@@ -1,0 +1,34 @@
+[metadata]
+generated_by = "mineconda/0.1.0"
+generated_at_unix = 0
+minecraft = "1.21.1"
+dependency_graph = true
+group_metadata = true
+
+[metadata.loader]
+kind = "neo-forge"
+version = "latest"
+
+[[packages]]
+id = "iris"
+source = "local"
+version = "vendor/iris.jar"
+side = "client"
+file_name = "iris.jar"
+sha256 = "pending"
+download_url = "vendor/iris.jar"
+hashes = []
+source_ref = "vendor/iris.jar"
+groups = ["default"]
+
+[[packages]]
+id = "jei"
+source = "local"
+version = "vendor/jei.jar"
+side = "both"
+file_name = "jei.jar"
+sha256 = "pending"
+download_url = "vendor/jei.jar"
+hashes = []
+source_ref = "vendor/jei.jar"
+groups = ["default"]

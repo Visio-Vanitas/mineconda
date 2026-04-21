@@ -1,0 +1,32 @@
+{
+  "components": [
+    {
+      "important": true,
+      "uid": "net.minecraft",
+      "version": "1.21.1"
+    },
+    {
+      "uid": "neoforge",
+      "version": "latest"
+    }
+  ],
+  "formatVersion": 1,
+  "mods": [
+    {
+      "id": "sk9rgfiA",
+      "source": "modrinth",
+      "version": "1.0.15+mc1.21.1"
+    },
+    {
+      "id": "325492",
+      "source": "curseforge",
+      "version": "5940240"
+    },
+    {
+      "id": "broken-cf",
+      "source": "curseforge",
+      "version": "not-numeric"
+    }
+  ],
+  "name": "fixture-export-pack"
+}
