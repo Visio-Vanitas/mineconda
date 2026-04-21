@@ -1316,13 +1316,20 @@ fn normalize_s3_key(raw: &str, config: &S3SourceConfig) -> Result<String> {
             if key == normalized_prefix {
                 bail!("s3 object key resolves to prefix only, expected a file key");
             }
-            if !key.starts_with(normalized_prefix) {
+            if !key_matches_prefix_path(&key, normalized_prefix) {
                 key = format!("{normalized_prefix}/{key}");
             }
         }
     }
 
     Ok(key)
+}
+
+fn key_matches_prefix_path(key: &str, prefix: &str) -> bool {
+    key == prefix
+        || key
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn build_s3_download_url(config: &S3SourceConfig, key: &str) -> Result<String> {
@@ -3148,6 +3155,26 @@ mod tests {
         let err = normalize_s3_key("s3://other-bucket/a.jar", &config)
             .expect_err("expected bucket mismatch");
         assert!(format!("{err:#}").contains("does not match configured bucket"));
+    }
+
+    #[test]
+    fn normalize_s3_key_applies_prefix_only_on_path_boundaries() {
+        let config = S3SourceConfig {
+            bucket: "mods-bucket".to_string(),
+            region: None,
+            endpoint: None,
+            public_base_url: None,
+            key_prefix: Some("packs/dev".to_string()),
+            path_style: false,
+        };
+
+        let key = normalize_s3_key("packs/development/iris.jar", &config)
+            .expect("prefix should be applied when only substring matches");
+        assert_eq!(key, "packs/dev/packs/development/iris.jar");
+
+        let full_key = normalize_s3_key("packs/dev/iris.jar", &config)
+            .expect("existing prefix path should be preserved");
+        assert_eq!(full_key, "packs/dev/iris.jar");
     }
 
     #[test]
