@@ -78,10 +78,8 @@ pub fn resolve_java_binary(
 }
 
 pub fn ensure_java_runtime(version: &str, provider: JavaProvider, force: bool) -> Result<PathBuf> {
-    if !force {
-        if let Some(path) = find_java_runtime(version, provider)? {
-            return Ok(path);
-        }
+    if !force && let Some(path) = find_java_runtime(version, provider)? {
+        return Ok(path);
     }
 
     if provider != JavaProvider::Temurin {
