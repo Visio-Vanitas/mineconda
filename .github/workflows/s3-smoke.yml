@@ -1,9 +1,6 @@
 name: experimental-s3-smoke
 
 on:
-  push:
-    branches:
-      - feature/s3-experimental
   workflow_dispatch:
     inputs:
       ssh_target:
