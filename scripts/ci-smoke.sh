@@ -12,6 +12,56 @@ require_env() {
   fi
 }
 
+if ! command -v rg >/dev/null 2>&1; then
+  rg() {
+    local fixed=0
+    local quiet=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -F)
+          fixed=1
+          shift
+          ;;
+        -q)
+          quiet=1
+          shift
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -*)
+          echo "[ci-smoke] failed: unsupported rg fallback option '$1'" >&2
+          return 2
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    if [[ $# -lt 1 ]]; then
+      echo "[ci-smoke] failed: rg fallback requires a pattern" >&2
+      return 2
+    fi
+
+    local pattern="$1"
+    shift
+    local cmd=(grep)
+    if (( fixed )); then
+      cmd+=(-F)
+    else
+      cmd+=(-E)
+    fi
+    if (( quiet )); then
+      cmd+=(-q)
+    fi
+    cmd+=(-- "$pattern")
+    cmd+=("$@")
+    "${cmd[@]}"
+  }
+fi
+
 if [[ ! -x "$BIN" ]]; then
   echo "[ci-smoke] mineconda binary not found at $BIN, building..."
   cargo build -p mineconda-cli >/dev/null
