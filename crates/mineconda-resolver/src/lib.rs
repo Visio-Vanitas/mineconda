@@ -1034,7 +1034,7 @@ fn resolve_curseforge_requirement(
         candidates = loader_filtered;
     }
 
-    candidates.sort_by(|a, b| b.id.cmp(&a.id));
+    candidates.sort_by_key(|item| std::cmp::Reverse(item.id));
 
     if !requirement.constraint.is_any() {
         let filtered: Vec<CurseforgeFile> = candidates

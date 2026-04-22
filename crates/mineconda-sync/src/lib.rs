@@ -155,11 +155,7 @@ pub fn sync_lockfile(lockfile: &mut Lockfile, request: &SyncRequest) -> Result<S
     };
     let mut expected_mod_files = HashSet::new();
 
-    for (package, outcome) in lockfile
-        .packages
-        .iter_mut()
-        .zip(resolved_outcomes.into_iter())
-    {
+    for (package, outcome) in lockfile.packages.iter_mut().zip(resolved_outcomes) {
         match outcome.source {
             CacheHitSource::Local => report.local_hits += 1,
             CacheHitSource::S3 => report.s3_hits += 1,
