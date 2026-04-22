@@ -1,4 +1,6 @@
 use crate::*;
+const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_NETWORK_RETRIES: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoctorLevel {
     Ok,
@@ -362,10 +364,37 @@ fn experimental_s3_smoke_enabled() -> bool {
         })
 }
 
+fn configured_network_timeout_secs() -> u64 {
+    env::var("MINECONDA_NETWORK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NETWORK_TIMEOUT_SECS)
+}
+
+fn configured_network_retries() -> usize {
+    env::var("MINECONDA_NETWORK_RETRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NETWORK_RETRIES)
+}
+
 pub(crate) fn cmd_doctor(root: &Path, strict: bool, no_color: bool) -> Result<()> {
     let use_color =
         std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() && !no_color;
     let mut counts = DoctorCounts::default();
+    doctor_log(
+        &mut counts,
+        DoctorLevel::Ok,
+        "network policy",
+        format!(
+            "timeout={}s retries={} (env: MINECONDA_NETWORK_TIMEOUT_SECS / MINECONDA_NETWORK_RETRIES)",
+            configured_network_timeout_secs(),
+            configured_network_retries()
+        ),
+        use_color,
+    );
 
     let manifest_path = manifest_path(root);
     let manifest = if !manifest_path.exists() {

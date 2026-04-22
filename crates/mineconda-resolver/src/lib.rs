@@ -33,7 +33,8 @@ const FORGE_MAVEN_METADATA_API: &str =
 const MINECRAFT_GAME_ID: usize = 432;
 const SEARCH_CACHE_TTL_SECS: u64 = 30 * 60;
 const SEARCH_CACHE_SCHEMA_VERSION: u32 = 2;
-const HTTP_RETRY_ATTEMPTS: usize = 3;
+const DEFAULT_NETWORK_RETRIES: usize = 2;
+const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone, Default)]
 pub struct ResolveRequest {
@@ -1793,11 +1794,23 @@ pub fn search_mods(request: &SearchRequest) -> Result<Vec<SearchResult>> {
         return Ok(cached);
     }
 
+    let stale_cache = read_stale_search_cache(request)?;
     let mut results = match request.source {
         SearchSource::Modrinth => search_modrinth(request),
         SearchSource::Curseforge => search_curseforge(request),
         SearchSource::Mcmod => search_mcmod(request),
-    }?;
+    }
+    .or_else(|err| {
+        if let Some(cached) = stale_cache {
+            eprintln!(
+                "warning: search request failed, using stale cached results for `{}`: {err}",
+                request.query
+            );
+            Ok(cached)
+        } else {
+            Err(err)
+        }
+    })?;
 
     if request.source == SearchSource::Mcmod {
         enrich_mcmod_search_links(&mut results)?;
@@ -2186,6 +2199,17 @@ fn search_mcmod(request: &SearchRequest) -> Result<Vec<SearchResult>> {
 }
 
 fn read_search_cache(request: &SearchRequest) -> Result<Option<Vec<SearchResult>>> {
+    read_search_cache_with_policy(request, false)
+}
+
+fn read_stale_search_cache(request: &SearchRequest) -> Result<Option<Vec<SearchResult>>> {
+    read_search_cache_with_policy(request, true)
+}
+
+fn read_search_cache_with_policy(
+    request: &SearchRequest,
+    allow_stale: bool,
+) -> Result<Option<Vec<SearchResult>>> {
     let path = search_cache_path(request)?;
     if !path.exists() {
         return Ok(None);
@@ -2201,7 +2225,7 @@ fn read_search_cache(request: &SearchRequest) -> Result<Option<Vec<SearchResult>
     };
 
     let age = unix_timestamp().saturating_sub(cache.created_at_unix);
-    if age > SEARCH_CACHE_TTL_SECS {
+    if !allow_stale && age > SEARCH_CACHE_TTL_SECS {
         return Ok(None);
     }
     if cache.schema_version != SEARCH_CACHE_SCHEMA_VERSION {
@@ -2765,14 +2789,15 @@ fn send_with_retry<F>(mut build: F, label: &str) -> Result<Response>
 where
     F: FnMut() -> reqwest::blocking::RequestBuilder,
 {
+    let max_attempts = configured_network_retries().saturating_add(1);
     let mut last_error = None;
 
-    for attempt in 0..HTTP_RETRY_ATTEMPTS {
+    for attempt in 0..max_attempts {
         match build().send() {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => return Ok(response),
                 Err(err) => {
-                    if attempt + 1 < HTTP_RETRY_ATTEMPTS
+                    if attempt + 1 < max_attempts
                         && err.status().is_some_and(should_retry_http_status)
                     {
                         last_error = Some(anyhow!("{label}: {err}"));
@@ -2783,7 +2808,7 @@ where
                 }
             },
             Err(err) => {
-                if attempt + 1 < HTTP_RETRY_ATTEMPTS && should_retry_http_error(&err) {
+                if attempt + 1 < max_attempts && should_retry_http_error(&err) {
                     last_error = Some(anyhow!("{label}: {err}"));
                     sleep(http_retry_backoff(attempt));
                     continue;
@@ -2813,18 +2838,44 @@ fn should_retry_http_error(err: &reqwest::Error) -> bool {
 }
 
 fn http_retry_backoff(attempt: usize) -> Duration {
-    match attempt {
-        0 => Duration::from_millis(250),
-        1 => Duration::from_millis(800),
-        _ => Duration::from_millis(1500),
-    }
+    let base = match attempt {
+        0 => 250,
+        1 => 800,
+        _ => 1500,
+    };
+    Duration::from_millis(base + retry_jitter_millis())
+}
+
+fn retry_jitter_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.subsec_nanos() as u64) % 120)
+        .unwrap_or(0)
+}
+
+fn configured_network_retries() -> usize {
+    env::var("MINECONDA_NETWORK_RETRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NETWORK_RETRIES)
+}
+
+fn configured_network_timeout_secs() -> u64 {
+    env::var("MINECONDA_NETWORK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NETWORK_TIMEOUT_SECS)
 }
 
 fn build_http_client() -> Result<Client> {
+    let timeout_secs = configured_network_timeout_secs();
+    let connect_timeout_secs = timeout_secs.clamp(1, 8);
     let mut builder = Client::builder()
         .user_agent(http_user_agent())
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(35));
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs));
 
     if env::var_os("MINECONDA_NO_PROXY")
         .map(|value| value != "0")
@@ -2840,6 +2891,59 @@ fn build_http_client() -> Result<Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => unsafe {
+                    env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time drift")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "mineconda-resolver-{label}-{}-{nonce}",
+            process::id()
+        ));
+        fs::create_dir_all(&path).expect("failed to create temp dir");
+        path
+    }
 
     #[test]
     fn merge_requirement_detects_conflicting_exact_versions() {
@@ -3105,6 +3209,80 @@ mod tests {
         assert!(should_retry_http_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(should_retry_http_status(StatusCode::BAD_GATEWAY));
         assert!(!should_retry_http_status(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn network_http_policy_defaults_and_env_override() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe {
+            env::remove_var("MINECONDA_NETWORK_TIMEOUT_SECS");
+            env::remove_var("MINECONDA_NETWORK_RETRIES");
+        }
+        assert_eq!(
+            configured_network_timeout_secs(),
+            DEFAULT_NETWORK_TIMEOUT_SECS
+        );
+        assert_eq!(configured_network_retries(), DEFAULT_NETWORK_RETRIES);
+
+        let _timeout = ScopedEnv::set("MINECONDA_NETWORK_TIMEOUT_SECS", "9");
+        let _retries = ScopedEnv::set("MINECONDA_NETWORK_RETRIES", "5");
+        assert_eq!(configured_network_timeout_secs(), 9);
+        assert_eq!(configured_network_retries(), 5);
+    }
+
+    #[test]
+    fn stale_search_cache_policy_allows_expired_entries() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let cache_dir = temp_dir("search-stale-cache");
+        let _cache_env = ScopedEnv::set(
+            "MINECONDA_SEARCH_CACHE_DIR",
+            cache_dir.to_str().expect("cache dir path"),
+        );
+        let request = SearchRequest {
+            source: SearchSource::Modrinth,
+            query: "iris".to_string(),
+            limit: 3,
+            page: 2,
+            minecraft_version: Some("1.21.1".to_string()),
+            loader: Some(LoaderKind::NeoForge),
+        };
+
+        let path = search_cache_path(&request).expect("cache path");
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("cache parent");
+        let payload = SearchCacheEntry {
+            schema_version: SEARCH_CACHE_SCHEMA_VERSION,
+            created_at_unix: unix_timestamp().saturating_sub(SEARCH_CACHE_TTL_SECS + 15),
+            results: vec![SearchResult {
+                id: "iris".to_string(),
+                slug: "iris".to_string(),
+                title: "Iris".to_string(),
+                summary: "cached".to_string(),
+                source: SearchSource::Modrinth,
+                downloads: Some(1),
+                url: "https://modrinth.com/mod/iris".to_string(),
+                dependencies: Vec::new(),
+                supported_side: Some(ModSide::Client),
+                source_homepage: Some("https://modrinth.com/mod/iris".to_string()),
+                linked_modrinth_url: Some("https://modrinth.com/mod/iris".to_string()),
+                linked_curseforge_url: None,
+                linked_github_url: None,
+            }],
+        };
+        fs::write(path, serde_json::to_vec(&payload).expect("encode payload"))
+            .expect("write cache");
+
+        assert!(
+            read_search_cache(&request)
+                .expect("fresh cache read")
+                .is_none()
+        );
+        let stale = read_stale_search_cache(&request)
+            .expect("stale cache read")
+            .expect("stale cache entries");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "iris");
+
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]

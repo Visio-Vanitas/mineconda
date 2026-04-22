@@ -289,6 +289,28 @@ fn compute_lock_diff_entries(current: Option<&Lockfile>, desired: &Lockfile) -> 
     entries
 }
 
+fn apply_network_overrides(timeout_secs: Option<u64>, retries: Option<usize>) -> Result<()> {
+    if let Some(timeout_secs) = timeout_secs {
+        if timeout_secs == 0 {
+            bail!("--network-timeout must be >= 1 second");
+        }
+        unsafe {
+            env::set_var("MINECONDA_NETWORK_TIMEOUT_SECS", timeout_secs.to_string());
+        }
+    }
+    if let Some(retries) = retries {
+        if retries == 0 {
+            bail!("--network-retries must be >= 1");
+        }
+        unsafe {
+            env::set_var("MINECONDA_NETWORK_RETRIES", retries.to_string());
+            // Keep legacy sync-only override wired for compatibility with existing environments.
+            env::set_var("MINECONDA_SYNC_RETRIES", retries.to_string());
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root;
@@ -329,7 +351,10 @@ pub fn run() -> Result<()> {
             side,
             group,
             no_lock,
+            network_timeout,
+            network_retries,
         } => {
+            apply_network_overrides(network_timeout, network_retries)?;
             let target = resolve_project_target(&root, &scope)?;
             cmd_add(&target.root, id, source, version, side, group, no_lock)?
         }
@@ -373,7 +398,10 @@ pub fn run() -> Result<()> {
             install_first,
             install_version,
             group,
+            network_timeout,
+            network_retries,
         } => {
+            apply_network_overrides(network_timeout, network_retries)?;
             let target = resolve_project_target(&root, &scope)?;
             cmd_search(
                 &target.root,
@@ -472,51 +500,63 @@ pub fn run() -> Result<()> {
             check,
             groups,
             all_groups,
-        } => match command {
-            Some(LockCommands::Diff { json }) => {
-                if check {
-                    bail!("`mineconda lock diff` does not accept `--check`");
+            network_timeout,
+            network_retries,
+        } => {
+            apply_network_overrides(network_timeout, network_retries)?;
+            match command {
+                Some(LockCommands::Diff { json }) => {
+                    if check {
+                        bail!("`mineconda lock diff` does not accept `--check`");
+                    }
+                    let workspace = load_workspace_optional(&root)?;
+                    if workspace.is_some() && scope.all_members {
+                        cmd_lock_diff_workspace(
+                            &root,
+                            upgrade,
+                            groups,
+                            all_groups,
+                            &scope.profiles,
+                            json,
+                        )?
+                    } else {
+                        let target = resolve_project_target(&root, &scope)?;
+                        let selection = ProjectSelection {
+                            groups: &groups,
+                            all_groups,
+                            profiles: &scope.profiles,
+                            workspace: target.workspace.as_ref(),
+                            member_name: target.member_name.as_deref(),
+                        };
+                        cmd_lock_diff(&target.root, upgrade, json, selection)?
+                    }
                 }
-                let workspace = load_workspace_optional(&root)?;
-                if workspace.is_some() && scope.all_members {
-                    cmd_lock_diff_workspace(
-                        &root,
-                        upgrade,
-                        groups,
-                        all_groups,
-                        &scope.profiles,
-                        json,
-                    )?
-                } else {
-                    let target = resolve_project_target(&root, &scope)?;
-                    let selection = ProjectSelection {
-                        groups: &groups,
-                        all_groups,
-                        profiles: &scope.profiles,
-                        workspace: target.workspace.as_ref(),
-                        member_name: target.member_name.as_deref(),
-                    };
-                    cmd_lock_diff(&target.root, upgrade, json, selection)?
+                None => {
+                    let workspace = load_workspace_optional(&root)?;
+                    if workspace.is_some() && scope.all_members {
+                        cmd_lock_workspace(
+                            &root,
+                            upgrade,
+                            check,
+                            groups,
+                            all_groups,
+                            &scope.profiles,
+                        )?
+                    } else {
+                        let target = resolve_project_target(&root, &scope)?;
+                        cmd_lock(
+                            &target.root,
+                            upgrade,
+                            check,
+                            groups,
+                            all_groups,
+                            &scope.profiles,
+                            target.workspace.as_ref(),
+                        )?
+                    }
                 }
             }
-            None => {
-                let workspace = load_workspace_optional(&root)?;
-                if workspace.is_some() && scope.all_members {
-                    cmd_lock_workspace(&root, upgrade, check, groups, all_groups, &scope.profiles)?
-                } else {
-                    let target = resolve_project_target(&root, &scope)?;
-                    cmd_lock(
-                        &target.root,
-                        upgrade,
-                        check,
-                        groups,
-                        all_groups,
-                        &scope.profiles,
-                        target.workspace.as_ref(),
-                    )?
-                }
-            }
-        },
+        }
         Commands::Status {
             groups,
             all_groups,
@@ -553,7 +593,10 @@ pub fn run() -> Result<()> {
             verbose_cache,
             groups,
             all_groups,
+            network_timeout,
+            network_retries,
         } => {
+            apply_network_overrides(network_timeout, network_retries)?;
             let workspace = load_workspace_optional(&root)?;
             if workspace.is_some() && scope.all_members {
                 cmd_sync_workspace(

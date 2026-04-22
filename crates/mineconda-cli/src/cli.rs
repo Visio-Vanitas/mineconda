@@ -57,6 +57,10 @@ pub(crate) enum Commands {
         group: Option<String>,
         #[arg(long)]
         no_lock: bool,
+        #[arg(long)]
+        network_timeout: Option<u64>,
+        #[arg(long)]
+        network_retries: Option<usize>,
     },
     Remove {
         id: String,
@@ -109,6 +113,10 @@ pub(crate) enum Commands {
         install_version: Option<String>,
         #[arg(long)]
         group: Option<String>,
+        #[arg(long)]
+        network_timeout: Option<u64>,
+        #[arg(long)]
+        network_retries: Option<usize>,
     },
     Tree {
         id: Option<String>,
@@ -174,6 +182,10 @@ pub(crate) enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        network_timeout: Option<u64>,
+        #[arg(long)]
+        network_retries: Option<usize>,
     },
     Status {
         #[arg(long = "group")]
@@ -212,6 +224,10 @@ pub(crate) enum Commands {
         groups: Vec<String>,
         #[arg(long)]
         all_groups: bool,
+        #[arg(long)]
+        network_timeout: Option<u64>,
+        #[arg(long)]
+        network_retries: Option<usize>,
     },
     Doctor {
         #[arg(long)]
@@ -645,23 +661,45 @@ mod tests {
 
     #[test]
     fn cli_parses_check_flags_for_lock_and_sync() {
-        let cli = Cli::try_parse_from(["mineconda", "lock", "--check"]).expect("lock check parse");
+        let cli = Cli::try_parse_from([
+            "mineconda",
+            "lock",
+            "--check",
+            "--network-timeout",
+            "25",
+            "--network-retries",
+            "4",
+        ])
+        .expect("lock check parse");
         assert!(matches!(
             cli.command,
             Commands::Lock {
                 command: None,
                 check: true,
+                network_timeout: Some(25),
+                network_retries: Some(4),
                 ..
             }
         ));
 
-        let cli =
-            Cli::try_parse_from(["mineconda", "sync", "--check", "--json"]).expect("sync parse");
+        let cli = Cli::try_parse_from([
+            "mineconda",
+            "sync",
+            "--check",
+            "--json",
+            "--network-timeout",
+            "15",
+            "--network-retries",
+            "2",
+        ])
+        .expect("sync parse");
         assert!(matches!(
             cli.command,
             Commands::Sync {
                 check: true,
                 json: true,
+                network_timeout: Some(15),
+                network_retries: Some(2),
                 ..
             }
         ));

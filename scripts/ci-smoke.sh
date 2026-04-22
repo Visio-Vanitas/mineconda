@@ -82,13 +82,30 @@ echo "[ci-smoke] init"
 "$BIN" --root "$PROJECT_ROOT" init mypack --minecraft 1.21.1 --loader neoforge --loader-version latest
 
 echo "[ci-smoke] search iris (default source)"
-"$BIN" --root "$PROJECT_ROOT" search iris --limit 5 --page 2 >/dev/null
-"$BIN" --root "$PROJECT_ROOT" search iris --limit 5 --page 2 >/dev/null
+"$BIN" --root "$PROJECT_ROOT" search iris --limit 5 --page 2 --network-timeout 20 --network-retries 2 >/dev/null
+"$BIN" --root "$PROJECT_ROOT" search iris --limit 5 --page 2 --network-timeout 20 --network-retries 2 >/dev/null
 test -d "$MINECONDA_CACHE_DIR/search-results"
 test "$(find "$MINECONDA_CACHE_DIR/search-results" -name '*.json' | wc -l | tr -d ' ')" -ge 1
 
+echo "[ci-smoke] search fallback to stale cache under broken proxy"
+command -v python3 >/dev/null
+SEARCH_CACHE_FILE="$(find "$MINECONDA_CACHE_DIR/search-results" -name '*.json' | head -n 1)"
+test -n "$SEARCH_CACHE_FILE"
+SEARCH_CACHE_FILE="$SEARCH_CACHE_FILE" python3 <<'PY'
+import json
+import os
+path = os.environ["SEARCH_CACHE_FILE"]
+with open(path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+payload["created_at_unix"] = 1
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(payload, f)
+PY
+HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+  "$BIN" --root "$PROJECT_ROOT" search iris --limit 5 --page 2 --non-interactive --network-timeout 1 --network-retries 1 >/dev/null
+
 echo "[ci-smoke] search install-first (default source)"
-"$BIN" --root "$PROJECT_ROOT" search embeddium --limit 1 --page 1 --install-first --non-interactive
+"$BIN" --root "$PROJECT_ROOT" search embeddium --limit 1 --page 1 --install-first --non-interactive --network-timeout 20 --network-retries 2
 rg -q 'id = "embeddium"' "$PROJECT_ROOT/mineconda.toml"
 test "$(find "$PROJECT_ROOT/mods" -maxdepth 1 -name 'embeddium*.jar' | wc -l | tr -d ' ')" -ge 1
 
@@ -242,15 +259,16 @@ echo "[ci-smoke] upgrade lock (alias)"
 "$BIN" --root "$PROJECT_ROOT" upgrade
 
 echo "[ci-smoke] sync --jobs 2 --verbose-cache"
-sync_out="$("$BIN" --root "$PROJECT_ROOT" sync --jobs 2 --verbose-cache)"
+sync_out="$("$BIN" --root "$PROJECT_ROOT" sync --jobs 2 --verbose-cache --network-timeout 20 --network-retries 2)"
 printf '%s\n' "$sync_out"
 printf '%s\n' "$sync_out" | rg -q 'sync done: packages='
+printf '%s\n' "$sync_out" | rg -q 'network_attempts='
 
 echo "[ci-smoke] sync --locked"
-"$BIN" --root "$PROJECT_ROOT" sync --locked
+"$BIN" --root "$PROJECT_ROOT" sync --locked --network-timeout 20 --network-retries 2
 
 echo "[ci-smoke] sync --json"
-sync_json="$("$BIN" --root "$PROJECT_ROOT" sync --check --json)"
+sync_json="$("$BIN" --root "$PROJECT_ROOT" sync --check --json --network-timeout 20 --network-retries 2)"
 printf '%s\n' "$sync_json"
 JSON_PAYLOAD="$sync_json" python3 <<'PY'
 import json

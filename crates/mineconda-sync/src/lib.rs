@@ -23,6 +23,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 type HmacSha256 = Hmac<Sha256>;
+const DEFAULT_NETWORK_RETRIES: usize = 2;
+const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct SyncRequest {
@@ -40,6 +42,7 @@ pub struct SyncReport {
     pub local_hits: usize,
     pub s3_hits: usize,
     pub origin_downloads: usize,
+    pub network_attempts: usize,
     pub installed: usize,
     pub removed: usize,
     pub failed: usize,
@@ -100,10 +103,7 @@ pub struct RemotePruneReport {
 }
 
 pub fn sync_lockfile(lockfile: &mut Lockfile, request: &SyncRequest) -> Result<SyncReport> {
-    let client = Client::builder()
-        .user_agent(http_user_agent())
-        .build()
-        .context("failed to build HTTP client for sync")?;
+    let client = build_sync_http_client("failed to build HTTP client for sync")?;
 
     let cache_root = cache_root()?;
     fs::create_dir_all(&cache_root)
@@ -161,6 +161,7 @@ pub fn sync_lockfile(lockfile: &mut Lockfile, request: &SyncRequest) -> Result<S
             CacheHitSource::S3 => report.s3_hits += 1,
             CacheHitSource::Origin => report.origin_downloads += 1,
         }
+        report.network_attempts += outcome.network_attempts;
 
         if request.verbose_cache {
             println!(
@@ -297,10 +298,7 @@ pub fn remote_prune_s3_cache(
     config: &S3CacheConfig,
     request: &RemotePruneRequest,
 ) -> Result<RemotePruneReport> {
-    let client = Client::builder()
-        .user_agent(http_user_agent())
-        .build()
-        .context("failed to build HTTP client for remote prune")?;
+    let client = build_sync_http_client("failed to build HTTP client for remote prune")?;
     let backend = configure_s3_cache_backend(Some(config))?
         .context("cache.s3 must be configured and enabled for remote prune")?;
 
@@ -398,6 +396,7 @@ fn partition_prune_candidates(
 struct CacheOutcome {
     cache_path: PathBuf,
     source: CacheHitSource,
+    network_attempts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -581,6 +580,7 @@ fn ensure_cached_package(
             return Ok(CacheOutcome {
                 cache_path,
                 source: CacheHitSource::Local,
+                network_attempts: 0,
             });
         }
         fs::remove_file(&cache_path).with_context(|| {
@@ -602,21 +602,25 @@ fn ensure_cached_package(
             .with_context(|| format!("failed to delete temp file {}", tmp_path.display()))?;
     }
 
+    let mut network_attempts = 0usize;
     let source = if let Some(s3_cache) = s3_cache {
+        network_attempts += 1;
         match fetch_from_s3_cache(package, metadata, s3_cache, client, &tmp_path) {
             Ok(true) => CacheHitSource::S3,
             Ok(false) => {
-                fetch_package_to_path(package, project_root, client, &tmp_path)?;
+                network_attempts +=
+                    fetch_package_to_path(package, project_root, client, &tmp_path)?;
                 CacheHitSource::Origin
             }
             Err(err) => {
                 eprintln!("warning: s3 cache fetch failed for {}: {err:#}", package.id);
-                fetch_package_to_path(package, project_root, client, &tmp_path)?;
+                network_attempts +=
+                    fetch_package_to_path(package, project_root, client, &tmp_path)?;
                 CacheHitSource::Origin
             }
         }
     } else {
-        fetch_package_to_path(package, project_root, client, &tmp_path)?;
+        network_attempts += fetch_package_to_path(package, project_root, client, &tmp_path)?;
         CacheHitSource::Origin
     };
 
@@ -657,7 +661,11 @@ fn ensure_cached_package(
         );
     }
 
-    Ok(CacheOutcome { cache_path, source })
+    Ok(CacheOutcome {
+        cache_path,
+        source,
+        network_attempts,
+    })
 }
 
 fn fetch_from_s3_cache(
@@ -1161,7 +1169,7 @@ fn fetch_package_to_path(
     project_root: &Path,
     client: &Client,
     destination: &Path,
-) -> Result<()> {
+) -> Result<usize> {
     if package.download_url.eq_ignore_ascii_case("pending") {
         bail!(
             "package {} has pending download URL, run `mineconda lock` first",
@@ -1182,31 +1190,32 @@ fn fetch_package_to_path(
                     destination.display()
                 )
             })?;
+            Ok(0)
         }
         ModSource::Modrinth | ModSource::Curseforge | ModSource::Url | ModSource::S3 => {
-            download_remote_with_retries(client, &package.download_url, destination)?;
+            download_remote_with_retries(client, &package.download_url, destination)
         }
     }
-
-    Ok(())
 }
 
-fn download_remote_with_retries(client: &Client, url: &str, destination: &Path) -> Result<()> {
-    let retries = sync_download_retries();
-    for attempt in 1..=retries {
+fn download_remote_with_retries(client: &Client, url: &str, destination: &Path) -> Result<usize> {
+    let max_attempts = sync_download_attempts();
+    for attempt in 1..=max_attempts {
         let result = download_remote_once(client, url, destination);
         match result {
-            Ok(()) => return Ok(()),
-            Err(err) if attempt < retries => {
+            Ok(()) => return Ok(attempt),
+            Err(err) if attempt < max_attempts => {
                 let _ = fs::remove_file(destination);
-                eprintln!("warning: download attempt {attempt}/{retries} failed for {url}: {err}");
+                eprintln!(
+                    "warning: download attempt {attempt}/{max_attempts} failed for {url}: {err}"
+                );
                 sleep(Duration::from_millis(500 * attempt as u64));
             }
             Err(err) => return Err(err),
         }
     }
 
-    unreachable!("sync download retries loop should always return")
+    unreachable!("sync download attempts loop should always return")
 }
 
 fn download_remote_once(client: &Client, url: &str, destination: &Path) -> Result<()> {
@@ -1439,12 +1448,41 @@ fn cache_root() -> Result<PathBuf> {
         .join("mods"))
 }
 
-fn sync_download_retries() -> usize {
-    env::var("MINECONDA_SYNC_RETRIES")
+fn configured_network_retries() -> usize {
+    env::var("MINECONDA_NETWORK_RETRIES")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(3)
+        .or_else(|| {
+            env::var("MINECONDA_SYNC_RETRIES")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+        })
+        .unwrap_or(DEFAULT_NETWORK_RETRIES)
+}
+
+fn configured_network_timeout_secs() -> u64 {
+    env::var("MINECONDA_NETWORK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NETWORK_TIMEOUT_SECS)
+}
+
+fn sync_download_attempts() -> usize {
+    configured_network_retries().saturating_add(1)
+}
+
+fn build_sync_http_client(context: &str) -> Result<Client> {
+    let timeout_secs = configured_network_timeout_secs();
+    let connect_timeout_secs = timeout_secs.clamp(1, 8);
+    Client::builder()
+        .user_agent(http_user_agent())
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context(context.to_string())
 }
 
 fn cache_path_for_package(cache_root: &Path, package: &LockedPackage) -> PathBuf {

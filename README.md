@@ -92,6 +92,11 @@ Useful package-state commands:
 - `mineconda lock diff --json`, `status --json`, and `sync --json` provide machine-readable output with stable `0/2/1` exit codes
 - `mineconda ls --json`, `mineconda tree --json`, and `mineconda why <id> --json` expose structured package graph data for tooling
 
+Network tuning (core paths):
+
+- `add`, `search`, `lock`, and `sync` support `--network-timeout <seconds>` and `--network-retries <count>`
+- `mineconda doctor` reports the currently effective network policy for troubleshooting
+
 ## Dependency Groups
 
 `mineconda` supports named dependency groups for splitting one project into multiple install

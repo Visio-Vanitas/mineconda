@@ -92,6 +92,11 @@ mineconda [--root <PATH>] [--member <MEMBER>] [--profile <NAME>] [--no-color] [-
 - `mineconda lock diff --json`、`status --json`、`sync --json` 可用于脚本集成，并保持稳定的 `0/2/1` 退出码
 - `mineconda ls --json`、`mineconda tree --json`、`mineconda why <id> --json` 可输出结构化依赖数据
 
+网络调优（核心链路）：
+
+- `add`、`search`、`lock`、`sync` 支持 `--network-timeout <秒>` 与 `--network-retries <次数>`
+- `mineconda doctor` 会输出当前生效的网络策略，便于排障
+
 ## Dependency Groups
 
 `mineconda` 支持命名依赖组，用来把一个项目拆成多个可选安装面，语义上接近 `uv`

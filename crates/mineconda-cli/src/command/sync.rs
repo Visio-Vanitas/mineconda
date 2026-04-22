@@ -89,11 +89,12 @@ pub(crate) fn build_sync_report(
     }
 
     lines.push(format!(
-        "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, installed={}, removed={}, failed={}",
+        "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, network_attempts={}, installed={}, removed={}, failed={}",
         report.package_count,
         report.local_hits,
         report.s3_hits,
         report.origin_downloads,
+        report.network_attempts,
         report.installed,
         report.removed,
         report.failed
@@ -205,11 +206,12 @@ pub(crate) fn build_sync_json_report(
     }
 
     messages.push(format!(
-        "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, installed={}, removed={}, failed={}",
+        "sync done: packages={}, local_hits={}, s3_hits={}, origin_downloads={}, network_attempts={}, installed={}, removed={}, failed={}",
         report.package_count,
         report.local_hits,
         report.s3_hits,
         report.origin_downloads,
+        report.network_attempts,
         report.installed,
         report.removed,
         report.failed
@@ -233,6 +235,7 @@ pub(crate) fn build_sync_json_report(
             local_hits: Some(report.local_hits),
             s3_hits: Some(report.s3_hits),
             origin_downloads: Some(report.origin_downloads),
+            network_attempts: Some(report.network_attempts),
             removed: Some(report.removed),
             failed: Some(report.failed),
             lockfile_updated,
@@ -279,6 +282,7 @@ fn build_sync_check_json_report(
                 local_hits: None,
                 s3_hits: None,
                 origin_downloads: None,
+                network_attempts: None,
                 removed: None,
                 failed: None,
                 lockfile_updated: false,
@@ -349,6 +353,7 @@ fn build_sync_check_json_report(
                 local_hits: None,
                 s3_hits: None,
                 origin_downloads: None,
+                network_attempts: None,
                 removed: None,
                 failed: None,
                 lockfile_updated: false,
@@ -403,6 +408,7 @@ fn build_sync_check_json_report(
             local_hits: None,
             s3_hits: None,
             origin_downloads: None,
+            network_attempts: None,
             removed: None,
             failed: None,
             lockfile_updated: false,
@@ -678,6 +684,7 @@ mod tests {
         assert_eq!(report.summary.packages, 1);
         assert_eq!(report.summary.installed, 0);
         assert_eq!(report.summary.missing, 1);
+        assert!(report.summary.network_attempts.is_none());
         assert_eq!(report.missing_packages.len(), 1);
         assert_eq!(report.missing_packages[0].id, "demo");
         assert!(
@@ -936,6 +943,7 @@ mods = [
 
         assert_eq!(report.exit_code, 0);
         assert!(report.output.contains("sync done: packages=1"));
+        assert!(report.output.contains("network_attempts="));
         assert!(project.path.join("mods/demo.jar").exists());
         let updated_lock = load_lockfile_required(&project.path).expect("updated lock");
         assert_eq!(updated_lock.packages.len(), 1);

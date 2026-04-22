@@ -163,6 +163,7 @@ fn sync_offline_uses_warmed_cache_with_multiple_jobs() -> Result<()> {
         },
     )?;
     assert_eq!(first.origin_downloads, 2);
+    assert_eq!(first.network_attempts, 0);
     assert_eq!(first.installed, 2);
 
     fs::remove_file(project_root.join("vendor/alpha.jar"))?;
@@ -183,6 +184,7 @@ fn sync_offline_uses_warmed_cache_with_multiple_jobs() -> Result<()> {
     )?;
     assert_eq!(second.local_hits, 2);
     assert_eq!(second.origin_downloads, 0);
+    assert_eq!(second.network_attempts, 0);
     assert!(project_root.join("mods/alpha.jar").exists());
     assert!(project_root.join("mods/beta.jar").exists());
     Ok(())
@@ -316,6 +318,7 @@ fn sync_promotes_pending_cache_entry_to_hashed_cache_key() -> Result<()> {
         },
     )?;
     assert_eq!(report.origin_downloads, 1);
+    assert_eq!(report.network_attempts, 0);
 
     let package = &lock.packages[0];
     let hashed_cache_path = cache_path_for_package_in(&cache_root, package);

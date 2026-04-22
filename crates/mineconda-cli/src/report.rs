@@ -274,6 +274,8 @@ pub(crate) struct SyncJsonSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) origin_downloads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) network_attempts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) removed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failed: Option<usize>,
