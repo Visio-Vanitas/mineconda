@@ -259,17 +259,16 @@ pub(crate) fn workspace_member_target(
     selector: &str,
 ) -> Result<WorkspaceMemberTarget> {
     let exact = normalize_member_entry(selector).ok();
-    if let Some(exact) = exact {
-        if workspace
+    if let Some(exact) = exact
+        && workspace
             .member_entries()
             .iter()
             .any(|member| member == &exact)
-        {
-            return Ok(WorkspaceMemberTarget {
-                name: exact.clone(),
-                root: workspace_root.join(&exact),
-            });
-        }
+    {
+        return Ok(WorkspaceMemberTarget {
+            name: exact.clone(),
+            root: workspace_root.join(&exact),
+        });
     }
 
     let selector = selector.trim();
