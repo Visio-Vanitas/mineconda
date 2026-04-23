@@ -316,8 +316,15 @@ MINECONDA_BIN="$(pwd)/target/release/mineconda" bash scripts/ci-smoke.sh
 
 ## Contributing
 
-Issues and PRs are welcome. Please keep changes focused, include tests where appropriate, and ensure the validation pipeline passes before submission.
+Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the expected workflow, validation steps, and review guidance.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the preferred reporting process.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of the following, at your option:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)

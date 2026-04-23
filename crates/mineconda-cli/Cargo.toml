@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Minecraft modpack manager inspired by uv"
+homepage.workspace = true
+repository.workspace = true
 default-run = "mineconda"
 
 [[bin]]

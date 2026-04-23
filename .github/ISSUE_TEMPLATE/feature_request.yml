@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a user-facing improvement or new workflow
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What workflow is blocked, slow, or awkward today?
+      placeholder: Describe the user problem first, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior or CLI workflow.
+      placeholder: Explain the expected command UX, config, or output.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List workarounds or alternative designs if you have them.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, related tools, launcher constraints, or screenshots.

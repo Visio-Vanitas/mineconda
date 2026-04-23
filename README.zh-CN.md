@@ -312,8 +312,15 @@ MINECONDA_BIN="$(pwd)/target/release/mineconda" bash scripts/ci-smoke.sh
 
 ## 贡献
 
-欢迎提交 Issue 和 PR。请尽量保持改动聚焦，在合适的地方补充测试，并在提交前确保验证流程通过。
+欢迎提交 Issue 和 PR。具体工作流、验证要求和评审约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 安全
+
+漏洞报告流程见 [SECURITY.md](SECURITY.md)。
 
 ## 许可证
 
-MIT OR Apache-2.0
+你可以任选以下任一协议使用本项目：
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)
